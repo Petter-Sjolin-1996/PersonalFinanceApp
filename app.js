@@ -1,9 +1,8 @@
 import * as C from './core.js';
 
-/* ------------------------------------------------------------- state ----- */
-/* Taxonomy, accounts and thresholds are DATA, not program logic.
+/* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
-   The list below is only a fallback for a repo that has no config yet. */
+   The list below is only a fallback for a repo with no config yet. */
 const FALLBACK_CATS = [
   ['Food & Drinks',['Groceries','Restaurant','Alcohol','Coffee & snacks']],
   ['Transport',['Taxi','Scooters & bikes','Public transport','Fuel','Parking','Other transport']],
@@ -17,17 +16,27 @@ const FALLBACK_CATS = [
 ].flatMap(([group, labels]) => labels.map(label => ({ group, label, fixed: false })));
 
 const CFG_KEY = 'ledger.cfg';
+const SECTIONS = {
+  control:      [['overview','Overview'], ['targets','Targets']],
+  transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
+  categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'], ['swish','Swish counterparties']],
+};
 
 let cfg = null, repo = null;
 let CONF = null, shaC = null, confDirty = false;
 let ledger = null, ann = null, shaL = null, shaA = null;
-let dirty = false, tab = 'personal', filter = 'todo', sort = 'value', query = '';
+let dirty = false, section = 'control', pane = 'overview';
+let filter = 'todo', sort = 'value', query = '', adjust = false;
 let pendingImport = null;
 
 const $ = id => document.getElementById(id);
 const el = h => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
 const kr = n => Math.round(n).toLocaleString('sv-SE') + ' kr';
+const kr0 = n => Math.round(n).toLocaleString('sv-SE');
 const cat = r => r && r.group ? r.group + ' / ' + r.label : '';
+const monthName = m => new Date(m + '-01').toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+
+/* ------------------------------------------------------------ derived ---- */
 const groups = () => {
   const g = new Map();
   for (const c of CONF.categories) { if (!g.has(c.group)) g.set(c.group, []); g.get(c.group).push(c); }
@@ -36,32 +45,58 @@ const groups = () => {
 const defaultFixed = (g, l) => !!CONF.categories.find(c => c.group === g && c.label === l)?.fixed;
 const ruleCount = (g, l) => Object.values(ann.merchantRules).filter(r => r.group === g && r.label === l).length;
 
-/* ------------------------------------------------------------ derived ---- */
-// Spending rows are everything personal: card + bank purchases, fees, and
-// businesses paid by Swish. Corporate card is handled on its own tab.
 const spendRows = () => ledger.transactions.filter(t =>
   ((t.role === 'spend' || t.role === 'fee') && t.account !== 'amex_corp') ||
   (t.role === 'p2p' && !(t.ref || '').startsWith('+46')));
+const mkey = t => t.role === 'p2p' ? t.ref : t.merchant;
 
 const merchants = () => {
   const m = new Map();
   for (const t of spendRows()) {
-    const key = t.role === 'p2p' ? t.ref : t.merchant;
-    const e = m.get(key) || { merchant: key, n: 0, total: 0, accounts: new Set(),
-                              first: t.date, last: t.date, tx: [], swish: t.role === 'p2p' };
-    e.n++; e.total += t.amount; e.accounts.add(e.swish ? 'swish' : t.account);
+    const k = mkey(t);
+    const e = m.get(k) || { merchant: k, n: 0, total: 0, accounts: new Set(), first: t.date, last: t.date, tx: [] };
+    e.n++; e.total += t.amount;
+    e.accounts.add(t.role === 'p2p' ? 'swish' : t.account);
     if (t.date < e.first) e.first = t.date;
     if (t.date > e.last) e.last = t.date;
-    e.tx.push(t); m.set(key, e);
+    e.tx.push(t); m.set(k, e);
   }
   return [...m.values()].map(e => ({ ...e, accounts: [...e.accounts], total: Math.round(e.total * 100) / 100 }));
 };
-
 const workOf = m => m.tx.filter(t => ann.workExpenses[t.fp]);
 const netOf  = m => m.tx.reduce((a, t) => a + (ann.workExpenses[t.fp] ? 0 : t.amount), 0);
 
+const trackedAccounts = () => (CONF.accounts || []).filter(a => a.tracked).map(a => a.id);
+const complete = () => C.completeMonths(ledger.coverage, ledger.transactions, trackedAccounts());
+
+/** Rows that count as personal spending in a given set of months.
+    Work-flagged rows never count; one-offs only when the switch is on. */
+function spendIn(months) {
+  const set = new Set(months);
+  return spendRows().filter(t =>
+    set.has(t.date.slice(0, 7)) &&
+    !ann.workExpenses[t.fp] &&
+    !(adjust && ann.oneOffs[t.fp]));
+}
+const groupOf = t => ann.merchantRules[mkey(t)]?.group || 'Unknown';
+
+/* ------------------------------------------------------------- counts ---- */
+const unconfirmed = () => merchants().filter(m => !ann.merchantRules[m.merchant]?.confirmed).length;
+const corpRows = () => ledger.transactions
+  .filter(t => t.account === 'amex_corp' && (t.role === 'spend' || t.role === 'fee'))
+  .sort((a, b) => a.date < b.date ? 1 : -1);
+const corpUnreviewed = () => {
+  const through = ann.corpReviewedThrough || '0000-00-00';
+  return corpRows().filter(t => t.date > through).length;
+};
+const swishRefs = () => [...new Set(ledger.transactions
+  .filter(t => t.role === 'p2p' && (t.ref || '').startsWith('+46')).map(t => t.ref))];
+const swishUnnamed = () => swishRefs().filter(r => !ann.swishNames[r]).length;
+
 /* -------------------------------------------------------------- sync ----- */
 function setSync(state, text) { const s = $('sync'); s.className = 'sync ' + state; s.textContent = text; }
+function markDirty() { dirty = true; if (repo) setSync('busy', 'unsaved'); }
+function banner(msg) { $('banner').innerHTML = msg ? `<div class="fatal">${msg}</div>` : ''; }
 
 async function connect() {
   repo = new C.Repo(cfg);
@@ -72,14 +107,17 @@ async function connect() {
   CONF = K ? K.json : { version: 1, categories: FALLBACK_CATS, meta: {}, accounts: [] };
   shaC = K ? K.sha : null;
   if (!CONF.categories?.length) CONF.categories = FALLBACK_CATS;
-  if (!L) throw new Error(`ledger.json not found in ${cfg.owner}/${cfg.repo}. Either the file is missing, or the token cannot see that repository — GitHub returns the same 404 for both. Check the repo name and that the token lists it under Repository access.`);
+  CONF.targets ||= { monthly: {}, annual: {} };
+  CONF.targets.monthly ||= {}; CONF.targets.annual ||= {};
+  if (!L) throw new Error(`ledger.json not found in ${cfg.owner}/${cfg.repo}. Either the file is missing, or the token cannot see that repository — GitHub returns the same 404 for both. Check the repo name, and that the token lists it under Repository access.`);
   ledger = L.json; shaL = L.sha;
+  ledger.coverage ||= [];
   CONF.meta = { ...(ledger.meta || {}), ...(CONF.meta || {}) };
   if (!CONF.accounts?.length) CONF.accounts = ledger.accounts || [];
-  ann = A ? A.json : { version: 1, merchantRules: {}, swishNames: {}, workExpenses: {}, corporatePrivate: {} };
+  ann = A ? A.json : { version: 1 };
   shaA = A ? A.sha : null;
-  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate']) ann[k] ||= {};
-  dirty = false; setSync('on', 'synced');
+  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs']) ann[k] ||= {};
+  dirty = false; confDirty = false; setSync('on', 'synced');
 }
 
 async function save() {
@@ -93,94 +131,259 @@ async function save() {
       shaC = await repo.write('config.json', CONF, shaC, 'Update configuration');
       confDirty = false;
     }
-    if (pendingImport === 'saved-ledger') pendingImport = null;
     dirty = false; setSync('on', 'synced'); toast('Saved to GitHub');
   } catch (e) { setSync('err', 'error'); banner(e.message); }
 }
 
-function markDirty() { dirty = true; if (repo) setSync('busy', 'unsaved'); }
+/* ============================================================ ROUTING ==== */
+function go(sec, p) {
+  section = sec;
+  const panes = SECTIONS[sec];
+  pane = p && panes.some(x => x[0] === p) ? p : panes[0][0];
+  document.querySelectorAll('#nav button').forEach(b => b.setAttribute('aria-pressed', b.dataset.s === sec));
 
-/* ------------------------------------------------------------ banner ----- */
-function banner(msg, kind = 'fatal') {
-  $('banner').innerHTML = msg ? `<div class="wrap"><div class="${kind}">${msg}</div></div>` : '';
+  const sn = $('subnavIn'); sn.innerHTML = '';
+  for (const [id, label] of panes) {
+    const badge = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed() : id === 'swish' ? swishUnnamed() : 0;
+    const b = el(`<button data-p="${id}" aria-pressed="${id === pane}">${label}
+      <em ${badge ? '' : 'hidden'}>${badge}</em></button>`);
+    b.onclick = () => go(sec, id);
+    sn.appendChild(b);
+  }
+  $('subnav').hidden = panes.length < 2;
+
+  const show = {
+    overview: 'viewControl', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
+    expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish',
+  };
+  for (const v of Object.values(show)) $(v).hidden = true;
+  $(show[pane]).hidden = false;
+  $('toolsPersonal').hidden = pane !== 'expenses';
+  $('gaugeWrap').hidden = pane !== 'expenses';
+
+  const n = unconfirmed() + corpUnreviewed() + swishUnnamed();
+  $('navBadge').textContent = n; $('navBadge').hidden = !n;
+
+  ({ overview: drawControl, targets: drawTargets, import: drawImport, coverage: drawCoverage,
+     expenses: render, corp: renderCorp, swish: renderSwish })[pane]();
+}
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dataset.s));
+
+/* ==================================================== EXPENSE CONTROL ==== */
+function drawControl() {
+  const host = $('viewControl');
+  const months = complete();
+  if (!months.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3><p>Import a full month for every account and this fills in.</p></div>'; return; }
+
+  const rows = spendIn(months);
+  const byMonth = {}; months.forEach(m => byMonth[m] = 0);
+  const byGroup = {};
+  for (const t of rows) {
+    byMonth[t.date.slice(0, 7)] += Math.abs(t.amount);
+    (byGroup[groupOf(t)] ||= {})[t.date.slice(0, 7)] = (byGroup[groupOf(t)][t.date.slice(0, 7)] || 0) + Math.abs(t.amount);
+  }
+  const last = months.at(-1);
+  const total = Object.values(byMonth).reduce((a, b) => a + b, 0);
+  const avg = total / months.length;
+  const T = CONF.targets;
+  const monthlyTargetTotal = Object.values(T.monthly).reduce((a, b) => a + b, 0)
+    + Object.values(T.annual).reduce((a, b) => a + b, 0) / 12;
+  const lastTotal = byMonth[last];
+  const oneOffCount = Object.keys(ann.oneOffs).length;
+
+  host.innerHTML = `
+    <div class="kpi">
+      <div class="stat"><b>${monthName(last)} — last complete month</b><span>${kr(lastTotal)}</span>
+        <small>${lastTotal > monthlyTargetTotal ? kr(lastTotal - monthlyTargetTotal) + ' over' : kr(monthlyTargetTotal - lastTotal) + ' under'} target</small></div>
+      <div class="stat"><b>Average per month</b><span>${kr(avg)}</span><small>across ${months.length} complete months</small></div>
+      <div class="stat big"><b>Monthly target, all groups</b><span>${kr(monthlyTargetTotal)}</span>
+        <small>monthly targets plus annual budgets ÷ 12</small></div>
+    </div>
+
+    <div class="verdict">Showing <b>${adjust ? 'spending excluding one-offs' : 'raw spending'}</b> for
+      ${months.length} complete months, ${monthName(months[0])} to ${monthName(last)}.
+      ${oneOffCount ? `${oneOffCount} transaction${oneOffCount > 1 ? 's are' : ' is'} marked one-off.` : 'Nothing is marked as a one-off yet.'}</div>
+    <div style="margin-top:12px"><label class="toggle"><input type="checkbox" id="adj" ${adjust ? 'checked' : ''}> Exclude one-offs</label></div>
+
+    <h3 class="sh">Total spend by month</h3>
+    <div class="trend">${months.map(m => {
+      const v = byMonth[m], h = Math.max(4, v / Math.max(...Object.values(byMonth)) * 108);
+      return `<div class="tcol"><span class="tval">${kr0(v / 1000 * 10 / 10)}k</span>
+        <div class="tbar ${v > monthlyTargetTotal ? 'over' : ''}" style="height:${h}px"></div>
+        <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`;
+    }).join('')}</div>
+    <p class="note">Bars in red exceed the combined monthly target of ${kr(monthlyTargetTotal)}.</p>
+
+    <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
+    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
+      ${Object.keys(T.monthly).sort().map(g => {
+        const a = byGroup[g]?.[last] || 0, t = T.monthly[g], pct = t ? Math.min(a / t * 100, 100) : 0;
+        return `<div class="tgt-r"><b>${g}</b>
+          <span class="v ${a > t ? 'over' : 'under'}">${kr(a)}</span><span class="v">${kr(t)}</span>
+          <div class="bar"><i class="${a > t ? 'over' : ''}" style="width:${pct}%"></i></div></div>`;
+      }).join('')}</div>
+
+    <h3 class="sh">Annual budgets — used so far this year</h3>
+    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Used</span><span>Budget</span><span>Pace</span></div>
+      ${Object.keys(T.annual).sort().map(g => {
+        const used = Object.values(byGroup[g] || {}).reduce((a, b) => a + b, 0);
+        const b = T.annual[g], pct = b ? Math.min(used / b * 100, 100) : 0;
+        const pace = months.length / 12 * 100;
+        return `<div class="tgt-r"><b>${g}</b>
+          <span class="v ${used > b * months.length / 12 ? 'over' : 'under'}">${kr(used)}</span>
+          <span class="v">${kr(b)}</span>
+          <div class="bar"><i class="${used > b ? 'over' : ''}" style="width:${pct}%"></i><u style="left:${pace}%"></u></div></div>`;
+      }).join('')}</div>
+    <p class="note">The vertical marker shows where you would be if spending were even across the year
+      — ${months.length} of 12 months elapsed.</p>`;
+
+  $('adj').onchange = e => { adjust = e.target.checked; drawControl(); };
 }
 
-/* ------------------------------------------------------------ import ----- */
-$('importBtn').onclick = () => { $('impOut').innerHTML = ''; $('impCommit').disabled = true; $('impModal').hidden = false; };
-$('impClose').onclick = () => { $('impModal').hidden = true; pendingImport = null; };
+function drawTargets() {
+  const host = $('viewTargets');
+  const T = CONF.targets;
+  const all = [...new Set(CONF.categories.map(c => c.group))].sort();
+  host.innerHTML = `<p class="lede">Steady groups get a monthly target. Lumpy ones — where a single trip or
+    a semi-annual bill dominates — get an annual budget instead, because a monthly figure for them would be
+    breached or trivially met almost every month. Move a group between the two by clearing one field and filling the other.</p>
+    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Monthly</span><span>Annual</span><span></span></div>
+    ${all.map(g => `<div class="tgt-r" data-g="${g}"><b>${g}</b>
+      <span class="tgtin"><input data-k="monthly" inputmode="numeric" value="${T.monthly[g] ?? ''}"></span>
+      <span class="tgtin"><input data-k="annual" inputmode="numeric" value="${T.annual[g] ?? ''}"></span>
+      <span class="v">${T.monthly[g] ? kr(T.monthly[g] * 12) + ' / yr' : T.annual[g] ? kr(T.annual[g] / 12) + ' / mo' : '—'}</span>
+    </div>`).join('')}</div>`;
+  host.querySelectorAll('.tgt-r').forEach(r => r.querySelectorAll('input').forEach(i => i.onchange = e => {
+    const g = r.dataset.g, k = i.dataset.k, v = parseFloat(e.target.value.replace(/\s/g, ''));
+    if (isFinite(v) && v > 0) { T[k][g] = Math.round(v); T[k === 'monthly' ? 'annual' : 'monthly'] && delete T[k === 'monthly' ? 'annual' : 'monthly'][g]; }
+    else delete T[k][g];
+    confDirty = true; markDirty(); drawTargets();
+  }));
+}
 
-$('impFiles').onchange = async e => {
+/* ========================================================== COVERAGE ===== */
+function drawCoverage() {
+  const acc = C.coverageByAccount(ledger.coverage, ledger.transactions);
+  const months = complete();
+  const labels = Object.fromEntries((CONF.accounts || []).map(a => [a.id, a.label]));
+  const tracked = trackedAccounts();
+  const end = months.length ? months.at(-1) : null;
+  $('viewCoverage').innerHTML = `
+    <p class="lede">Insights only use months where <b>every</b> tracked account has data. This is what the
+      ledger currently holds.</p>
+    <table class="cov"><thead><tr><th>Account</th><th>From</th><th>To</th><th>Basis</th></tr></thead><tbody>
+    ${tracked.map(id => {
+      const a = acc[id];
+      if (!a) return `<tr><td>${labels[id] || id}</td><td colspan="3" class="warnc">No data</td></tr>`;
+      const short = end && a.to < end + '-28';
+      return `<tr><td><b>${labels[id] || id}</b></td><td class="num">${a.from}</td>
+        <td class="num ${short ? 'warnc' : 'okc'}">${a.to}</td>
+        <td class="basis">${a.declared ? 'Declared by the export' : 'Inferred from first and last row'}</td></tr>`;
+    }).join('')}
+    </tbody></table>
+    <div class="callout">${months.length
+      ? `<b>${months.length} complete month${months.length > 1 ? 's' : ''}:</b> ${monthName(months[0])} to ${monthName(end)}.
+         Anything after ${end} is held back from insights until every account covers it.`
+      : '<b>No complete months yet.</b> Every tracked account needs to cover the same calendar month.'}</div>
+    <p class="note">Swedbank exports declare their own period in the file header, so their coverage is exact —
+      including days with no transactions. Amex exports carry no period and no running balance, so coverage is
+      inferred from the first and last row, and a gap in the middle would not be visible.</p>`;
+}
+
+/* ============================================================ IMPORT ===== */
+function drawImport() {
+  const acc = C.coverageByAccount(ledger.coverage, ledger.transactions);
+  const labels = Object.fromEntries((CONF.accounts || []).map(a => [a.id, a.label]));
+  $('viewImport').innerHTML = `
+    <p class="lede">Swedbank and Amex CSV exports. Files are read here in your browser — nothing is uploaded
+      anywhere except your own private repository. The account is detected from the file; you do not need to pick it.</p>
+    <div class="callout">${Object.entries(acc).map(([id, a]) =>
+      `<b>${labels[id] || id}</b> through ${a.to}`).join(' &nbsp;·&nbsp; ') || 'Ledger is empty.'}</div>
+    <input type="file" id="impFiles" accept=".csv,text/csv" multiple>
+    <div id="impOut"></div>
+    <div class="sheet-act" style="justify-content:flex-start">
+      <button class="btn pri" id="impCommit" disabled>Commit to ledger</button></div>`;
+  $('impFiles').onchange = onFiles;
+  $('impCommit').onclick = commitImport;
+}
+
+async function onFiles(e) {
   const out = $('impOut'); out.innerHTML = '<p class="msg">Reading…</p>';
-  const rows = [], notes = [], fatals = [];
+  const rows = [], notes = [], fatals = [], periods = [];
   for (const f of e.target.files) {
     try {
       const { text, encoding } = C.decode(await f.arrayBuffer());
       const p = C.parseFile(text);
       const breaks = C.checkChain(p.rows);
-      notes.push({ name: f.name, n: p.rows.length, enc: encoding, src: p.source,
+      const accts = [...new Set(p.rows.map(r => r.account))];
+      notes.push({ name: f.name, n: p.rows.length, enc: encoding, accts, period: p.period,
                    rejects: p.rejects.length, breaks: breaks.length });
-      if (breaks.length) fatals.push(`${f.name}: running balance does not chain across ${breaks.length} row(s) — the export is missing transactions. Re-download the full month.`);
+      if (breaks.length) fatals.push(`${f.name}: the running balance does not chain across ${breaks.length} row(s) — the export is missing transactions. Re-download the full period.`);
+      if (p.period) accts.forEach(a => periods.push({ account: a, ...p.period }));
       rows.push(...p.rows);
     } catch (err) { fatals.push(`${f.name}: ${err.message}`); }
   }
   await C.fingerprint(rows);
-  const meta = { dadSwish: ledger.meta.dadSwish, accountsByRef: Object.fromEntries(
-    ledger.accounts.filter(a => a.match.ref).map(a => [a.match.ref, a.id])
-      .concat(ledger.accounts.filter(a => a.match.konto).map(a => [`81059${a.match.konto}`, a.id]))) };
-  rows.forEach(r => { r.role = C.assignRole(r, meta); r.pair = null;
-                      r.review = (r.ref || '') === ledger.meta.dadSwish; });
+  const byRef = {};
+  for (const a of CONF.accounts || []) {
+    if (a.match?.ref) byRef[a.match.ref] = a.id;
+    if (a.match?.konto) byRef['81059' + a.match.konto] = a.id;
+  }
+  rows.forEach(r => { r.role = C.assignRole(r, { dadSwish: CONF.meta.dadSwish, accountsByRef: byRef });
+                      r.pair = null; r.review = (r.ref || '') === CONF.meta.dadSwish; });
 
   const { added, duplicates } = C.merge(ledger.transactions, rows);
+  const near = C.nearDuplicates(ledger.transactions, added);
   const known = new Set(merchants().map(m => m.merchant));
-  const fresh = [...new Set(added.filter(t => t.role === 'spend' || t.role === 'fee')
-                  .map(t => t.merchant).filter(m => !known.has(m)))];
+  const fresh = [...new Set(added.filter(t => t.role === 'spend' || t.role === 'fee').map(t => t.merchant).filter(m => !known.has(m)))];
+  const labels = Object.fromEntries((CONF.accounts || []).map(a => [a.id, a.label]));
 
   out.innerHTML = '<div class="diff">' + notes.map(n =>
-    `<div class="diff-r ${n.breaks || n.rejects ? 'bad' : ''}"><span>${n.name} · ${n.src} · ${n.enc}</span>
-     <b>${n.n} rows${n.rejects ? ` · ${n.rejects} unreadable` : ''}${n.breaks ? ` · ${n.breaks} chain breaks` : ''}</b></div>`).join('')
-    + `<div class="diff-r"><span><b>New transactions</b></span><b>${added.length}</b></div>`
-    + `<div class="diff-r"><span>Already in ledger (skipped)</span><b>${duplicates}</b></div>`
-    + `<div class="diff-r"><span>Merchants you have not seen before</span><b>${fresh.length}</b></div></div>`
+    `<div class="diff-r ${n.breaks || n.rejects ? 'bad' : ''}">
+      <span>${n.name}<br><span class="basis">${n.accts.map(a => labels[a] || a).join(', ')} · ${n.enc}${
+        n.period ? ` · ${n.period.from} → ${n.period.to} (${n.period.basis})` : ''}</span></span>
+      <b>${n.n} rows${n.rejects ? ` · ${n.rejects} unreadable` : ''}${n.breaks ? ` · ${n.breaks} chain breaks` : ''}</b></div>`).join('')
+    + `<div class="diff-r"><span><b>New transactions</b></span><b>${added.length}</b></div>
+       <div class="diff-r"><span>Already in ledger, skipped</span><b>${duplicates}</b></div>
+       <div class="diff-r"><span>Merchants not seen before</span><b>${fresh.length}</b></div>
+       ${near.length ? `<div class="diff-r bad"><span>Possible near-duplicates — same merchant, within 5 days, amount within 2%</span><b>${near.length}</b></div>` : ''}
+       </div>`
+    + (near.length ? `<div class="callout">${near.slice(0, 6).map(h =>
+        `${h.incoming.date} ${h.incoming.merchant} ${kr(h.incoming.amount)} — already have ${h.existing.date} ${kr(h.existing.amount)}`).join('<br>')}
+        <br><br>These are not identical, so they are being imported. Check them afterwards if a pending charge may have settled twice.</div>` : '')
     + (fatals.length ? `<div class="fatal">${fatals.join('<br>')}</div>` : '');
 
-  pendingImport = fatals.length ? null : added;
+  pendingImport = fatals.length ? null : { added, periods };
   $('impCommit').disabled = !added.length || !!fatals.length;
-};
+}
 
-$('impCommit').onclick = async () => {
+async function commitImport() {
   if (!pendingImport) return;
   setSync('busy', 'committing');
   try {
-    ledger.transactions.push(...pendingImport);
+    ledger.transactions.push(...pendingImport.added);
     ledger.transactions.sort((a, b) => a.date < b.date ? -1 : 1);
-    C.runMatchers(ledger.transactions);          // always across the whole ledger, never just the new rows
-    shaL = await repo.write('ledger.json', ledger, shaL, `Import ${pendingImport.length} transactions`);
-    pendingImport = null; $('impModal').hidden = true;
-    setSync('on', 'synced'); render(); renderCorp(); renderSwish();
-    toast('Ledger updated');
+    ledger.coverage = C.mergeCoverage(ledger.coverage, pendingImport.periods);
+    C.runMatchers(ledger.transactions);        // across the whole ledger, never just the new rows
+    ledger.lastImport = { at: new Date().toISOString(), rows: pendingImport.added.length };
+    shaL = await repo.write('ledger.json', ledger, shaL, `Import ${pendingImport.added.length} transactions`);
+    pendingImport = null;
+    setSync('on', 'synced'); toast('Ledger updated'); go('categorise', 'expenses');
   } catch (e) { setSync('err', 'error'); banner(e.message); }
-};
+}
 
-/* ---------------------------------------------------------- settings ----- */
-$('setBtn').onclick = () => {
-  if (cfg) { $('cfgOwner').value = cfg.owner; $('cfgRepo').value = cfg.repo; $('cfgToken').value = cfg.token; }
-  $('setMsg').textContent = ''; $('setModal').hidden = false;
-};
-$('setClose').onclick = () => $('setModal').hidden = true;
-$('setForget').onclick = () => { localStorage.removeItem(CFG_KEY); location.reload(); };
-$('setSave').onclick = async () => {
-  const next = { owner: $('cfgOwner').value.trim(), repo: $('cfgRepo').value.trim(), token: $('cfgToken').value.trim() };
-  if (!next.owner || !next.repo || !next.token) { $('setMsg').className = 'msg bad'; $('setMsg').textContent = 'All three fields are needed.'; return; }
-  $('setMsg').className = 'msg'; $('setMsg').textContent = 'Connecting…';
-  cfg = next;
-  try {
-    await connect();
-    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
-    $('setModal').hidden = true; banner(''); boot();
-  } catch (e) { $('setMsg').className = 'msg bad'; $('setMsg').textContent = e.message; setSync('err', 'error'); }
-};
+/* ========================================================= CATEGORISE ==== */
+function optionsFor(sel) {
+  let h = '<option value="">— pick a category —</option>';
+  h += `<option value="Unknown / Unknown"${sel === 'Unknown / Unknown' ? ' selected' : ''}>Unknown — decide later</option>`;
+  for (const [g, list] of groups()) {
+    h += `<optgroup label="${g}">`;
+    for (const c of list) { const v = g + ' / ' + c.label; h += `<option value="${v}"${v === sel ? ' selected' : ''}>${c.label}</option>`; }
+    h += '</optgroup>';
+  }
+  return h;
+}
 
-/* ------------------------------------------------------------ gauge ------ */
 function paintGauge() {
   const ms = merchants();
   let done = 0, vDone = 0, vAll = 0, left = 0;
@@ -195,21 +398,10 @@ function paintGauge() {
   $('lkr').textContent = kr(left);
 }
 
-/* --------------------------------------------------------- merchants ----- */
-function optionsFor(sel) {
-  let h = '<option value="">— pick a category —</option>';
-  h += `<option value="Unknown / Unknown"${sel === 'Unknown / Unknown' ? ' selected' : ''}>Unknown — decide later</option>`;
-  for (const [g, list] of groups()) {
-    h += `<optgroup label="${g}">`;
-    for (const c of list) { const v = g + ' / ' + c.label; h += `<option value="${v}"${v === sel ? ' selected' : ''}>${c.label}</option>`; }
-    h += '</optgroup>';
-  }
-  return h;
-}
-
 function card(m) {
   const r = ann.merchantRules[m.merchant] ||= { group: null, label: null, fixed: false, confirmed: false };
   const wq = workOf(m), net = netOf(m);
+  const ones = m.tx.filter(t => ann.oneOffs[t.fp]).length;
   const n = el(`<article class="m ${r.confirmed ? 'ok' : 'todo'}" data-m="${encodeURIComponent(m.merchant)}">
     <div class="m-head">
       <div class="m-id">
@@ -217,9 +409,10 @@ function card(m) {
         <div class="m-meta"><span class="num">${m.n}&times;</span><span>${m.first} → ${m.last}</span>
           ${m.accounts.map(a => `<span class="tag${a === 'swish' ? ' sw' : ''}">${a.replace('swb_','').replace('amex_','amex ')}</span>`).join('')}
           ${m.tx.some(t => t.review) ? '<span class="tag rev">check</span>' : ''}
-          ${wq.length ? `<span class="tag wk">${wq.length} work</span>` : ''}</div>
+          ${wq.length ? `<span class="tag wk">${wq.length} work</span>` : ''}
+          ${ones ? `<span class="tag one">${ones} one-off</span>` : ''}</div>
       </div>
-      <div class="m-amt num ${net < 0 ? 'neg' : ''}">${kr(net)}${wq.length ? `<small>was ${kr(m.total)}</small>` : ''}</div>
+      <div class="m-amt num">${kr(net)}${wq.length ? `<small>was ${kr(m.total)}</small>` : ''}</div>
       <div class="m-ctl">
         <select class="pick">${optionsFor(cat(r))}</select>
         <label class="toggle"><input type="checkbox" class="fix" ${r.fixed ? 'checked' : ''}> Fixed</label>
@@ -227,10 +420,13 @@ function card(m) {
         <button class="disc">${m.n > 1 ? `Show ${m.n} transactions` : 'Show transaction'}</button>
       </div>
     </div>
-    <div class="tx">${m.tx.map(t => `<div class="tx-r${ann.workExpenses[t.fp] ? ' wk' : ''}" data-fp="${t.fp}">
-      <span>${t.date} · ${(t.account || '').replace('swb_','').replace('amex_','amex ')}</span>
-      <span class="num">${kr(t.amount)}</span>
-      <label class="mini"><input type="checkbox" ${ann.workExpenses[t.fp] ? 'checked' : ''}> Work</label></div>`).join('')}</div>
+    <div class="tx">${m.tx.slice().sort((a, b) => a.date < b.date ? 1 : -1).map(t =>
+      `<div class="tx-r${ann.workExpenses[t.fp] ? ' wk' : ''}" data-fp="${t.fp}">
+        <span class="when">${t.date} · ${(t.account || '').replace('swb_','').replace('amex_','amex ')}</span>
+        <span class="num">${kr(t.amount)}</span>
+        <label class="mini"><input type="checkbox" class="cbw" ${ann.workExpenses[t.fp] ? 'checked' : ''}> Work</label>
+        <label class="mini"><input type="checkbox" class="cbo" ${ann.oneOffs[t.fp] ? 'checked' : ''}> One-off</label>
+       </div>`).join('')}</div>
   </article>`);
 
   n.querySelector('.pick').onchange = e => {
@@ -242,21 +438,25 @@ function card(m) {
   n.querySelector('.fix').onchange = e => { r.fixed = e.target.checked; markDirty(); };
   n.querySelector('.ok-btn').onclick = () => {
     if (!r.group) return toast('Pick a category first');
-    r.confirmed = !r.confirmed; markDirty(); render();
+    r.confirmed = !r.confirmed; markDirty(); render(); refreshBadges();
   };
   n.querySelector('.disc').onclick = () => n.classList.toggle('open');
-  n.querySelectorAll('.tx-r input').forEach(cb => cb.onchange = ev => {
+  const reopen = () => document.querySelector(`[data-m="${encodeURIComponent(m.merchant)}"]`)?.classList.add('open');
+  n.querySelectorAll('.cbw').forEach(cb => cb.onchange = ev => {
     const fp = ev.target.closest('.tx-r').dataset.fp;
     if (ev.target.checked) ann.workExpenses[fp] = true; else delete ann.workExpenses[fp];
-    markDirty(); render();
-    document.querySelector(`[data-m="${encodeURIComponent(m.merchant)}"]`)?.classList.add('open');
+    markDirty(); render(); reopen();
+  });
+  n.querySelectorAll('.cbo').forEach(cb => cb.onchange = ev => {
+    const fp = ev.target.closest('.tx-r').dataset.fp;
+    if (ev.target.checked) ann.oneOffs[fp] = true; else delete ann.oneOffs[fp];
+    markDirty(); render(); reopen();
   });
   return n;
 }
 
 function render() {
   if (!ledger) return;
-  const list = $('list');
   let ms = merchants().filter(m => {
     const r = ann.merchantRules[m.merchant];
     if (filter === 'todo' && r?.confirmed) return false;
@@ -265,9 +465,11 @@ function render() {
     if (query && !m.merchant.toLowerCase().includes(query)) return false;
     return true;
   });
-  ms.sort((a, b) => sort === 'value' ? Math.abs(b.total) - Math.abs(a.total) : b.n - a.n);
+  ms.sort((a, b) => sort === 'value' ? Math.abs(b.total) - Math.abs(a.total)
+                  : sort === 'count' ? b.n - a.n
+                  : (a.last < b.last ? 1 : a.last > b.last ? -1 : 0));
 
-  list.innerHTML = '';
+  const list = $('list'); list.innerHTML = '';
   if (!ms.length) list.appendChild(el(`<div class="empty"><h3>Nothing here</h3><p>${
     filter === 'todo' ? 'Every merchant is confirmed.' : 'Try a different filter.'}</p></div>`));
   else ms.forEach(m => list.appendChild(card(m)));
@@ -275,11 +477,11 @@ function render() {
   const pending = ms.filter(m => !ann.merchantRules[m.merchant]?.confirmed && ann.merchantRules[m.merchant]?.group);
   const b = $('bulk'); b.innerHTML = '';
   if (filter === 'todo' && pending.length > 1) {
-    const n = el(`<div class="bulk"><span><b>${pending.length}</b> merchants have a category already.
+    const n = el(`<div class="bulk"><span><b>${pending.length}</b> merchants already have a category.
       Confirm them all, then fix any that look wrong.</span><button class="btn pri">Confirm all ${pending.length}</button></div>`);
     n.querySelector('button').onclick = () => {
       pending.forEach(m => ann.merchantRules[m.merchant].confirmed = true);
-      markDirty(); render(); toast(pending.length + ' confirmed');
+      markDirty(); render(); refreshBadges(); toast(pending.length + ' confirmed');
     };
     b.appendChild(n);
   }
@@ -299,7 +501,7 @@ function summary() {
   const s = $('sum');
   if (!rows.length) { s.innerHTML = '<h2>Breakdown</h2><p class="lede">Confirm a few merchants and the breakdown builds here.</p>'; return; }
   const max = rows[0][1];
-  s.innerHTML = '<h2>Breakdown — confirmed only</h2>' + rows.map(([g, v]) =>
+  s.innerHTML = '<h2>Breakdown — confirmed only, whole ledger</h2>' + rows.map(([g, v]) =>
     `<div class="sum-r"><b>${g}</b><div class="sum-bar"><i style="width:${v / max * 100}%"></i></div>
      <em class="num">${kr(v)}</em></div>`).join('')
     + (wkTot ? `<div class="wknote"><b>${Object.keys(ann.workExpenses).length}</b> transactions marked work-related —
@@ -309,9 +511,21 @@ function summary() {
 /* --------------------------------------------------------- corporate ----- */
 function renderCorp() {
   if (!ledger) return;
-  const host = $('corpList'); host.innerHTML = '';
-  const rows = ledger.transactions.filter(t => t.account === 'amex_corp' && (t.role === 'spend' || t.role === 'fee'))
-    .sort((a, b) => a.date < b.date ? 1 : -1);
+  const rows = corpRows();
+  const unrev = corpUnreviewed();
+  const host = $('viewCorp');
+  host.querySelector('#corpTop')?.remove();
+  const top = el(`<div id="corpTop">${unrev
+    ? `<div class="bulk"><span><b>${unrev}</b> charge${unrev > 1 ? 's' : ''} imported since you last reviewed this card.</span>
+       <button class="btn pri">Mark all reviewed</button></div>`
+    : `<div class="callout">All ${rows.length} charges reviewed${ann.corpReviewedThrough ? ` through ${ann.corpReviewedThrough}` : ''}.</div>`}</div>`);
+  host.insertBefore(top, $('corpList'));
+  top.querySelector('button')?.addEventListener('click', () => {
+    ann.corpReviewedThrough = rows[0]?.date || null;
+    markDirty(); renderCorp(); refreshBadges(); toast('Marked reviewed');
+  });
+
+  const list = $('corpList'); list.innerHTML = '';
   let month = null, sub = 0, head = null;
   const flush = () => { if (head) head.querySelector('em').textContent = kr(sub); };
   for (const t of rows) {
@@ -319,7 +533,7 @@ function renderCorp() {
     if (mo !== month) {
       flush(); month = mo; sub = 0;
       head = el(`<div class="mo"><span>${new Date(mo + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</span><em class="num"></em></div>`);
-      host.appendChild(head);
+      list.appendChild(head);
     }
     sub += t.amount;
     const p = ann.corporatePrivate[t.fp];
@@ -337,11 +551,9 @@ function renderCorp() {
       pick.onchange = e => { const [g, l] = (e.target.value || ' / ').split(' / '); p.group = g || null; p.label = l || null; markDirty(); };
       row.appendChild(pick);
     }
-    host.appendChild(row);
+    list.appendChild(row);
   }
   flush();
-  const n = Object.keys(ann.corporatePrivate).length;
-  $('corpBadge').textContent = n; $('corpBadge').hidden = !n;
 }
 
 /* ------------------------------------------------------------- swish ----- */
@@ -376,7 +588,7 @@ function renderSwish() {
   $('swChart').innerHTML = '<div class="chart">' + months.map(m => `<div class="col">
     <div class="plot"><div class="pos" style="height:${m.recv / mx * 72}px"></div></div><div class="mid"></div>
     <div class="plot lower"><div class="neg2" style="height:${-m.sent / mx * 72}px"></div></div>
-    <em>${Math.round(m.net / 100) / 10}k</em><span class="lab">${new Date(m.m + '-01').toLocaleDateString('en-GB', { month: 'short' })}</span></div>`).join('') + '</div>';
+    <em>${Math.round(m.net / 100) / 10}k</em><span class="lab">${monthName(m.m).slice(0, 3)}</span></div>`).join('') + '</div>';
 
   const host = $('swPeople');
   host.innerHTML = '<div class="cp-h"><span>Person</span><span>Sent</span><span>Received</span><span>Net</span></div>';
@@ -387,38 +599,38 @@ function renderSwish() {
     r.querySelector('input').onchange = e => {
       const v = e.target.value.trim();
       if (v) ann.swishNames[c.ref] = v; else delete ann.swishNames[c.ref];
-      markDirty();
+      markDirty(); refreshBadges();
     };
     host.appendChild(r);
   }
 }
 
+function refreshBadges() {
+  const n = unconfirmed() + corpUnreviewed() + swishUnnamed();
+  $('navBadge').textContent = n; $('navBadge').hidden = !n;
+  document.querySelectorAll('#subnavIn button').forEach(b => {
+    const id = b.dataset.p;
+    const v = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed() : id === 'swish' ? swishUnnamed() : 0;
+    const em = b.querySelector('em'); em.textContent = v; em.hidden = !v;
+  });
+}
 
-/* ------------------------------------------------------- config editor --- */
-/* Categories and settings are yours to change without a deploy. Renaming a
-   label rewrites every merchant rule that points at it, so nothing is
-   orphaned; deleting one is refused while rules still use it. */
-
-const confBtn = el('<button class="btn" id="confBtn" hidden>Categories</button>');
-document.querySelector('.acts').insertBefore(confBtn, document.getElementById('setBtn'));
-confBtn.onclick = openConfig;
-
+/* -------------------------------------------------- categories editor ---- */
+$('confBtn').onclick = openConfig;
 function openConfig() {
   if (!CONF || !ann) return toast('Connect first');
-  document.getElementById('confModal')?.remove();
+  $('confModal')?.remove();
   const m = el(`<div class="modal" id="confModal"><div class="sheet wide">
     <h2>Categories &amp; settings</h2>
-    <p class="lede">Stored in <b>config.json</b> in your private repo. Changes take effect immediately;
-      press <b>Save</b> in the header to commit them.</p>
+    <p class="lede">Stored in <b>config.json</b> in your private repo. Renaming a label rewrites every merchant
+      rule that points at it. Deleting one is refused while rules still use it.</p>
     <div id="confList"></div>
-    <div class="addrow">
-      <input id="newGroup" placeholder="New group name" autocapitalize="words">
-      <button class="btn" id="addGroup">Add group</button>
-    </div>
+    <div class="addrow"><input id="newGroup" placeholder="New group name" autocapitalize="words">
+      <button class="btn" id="addGroup">Add group</button></div>
     <h3 class="sh">Settings</h3>
     <label>Opening receivable at ${CONF.meta.openingDate || 'start'} (kr)
       <input id="mOpen" inputmode="numeric" value="${CONF.meta.openingReceivable ?? ''}"></label>
-    <label>Dad — Swish number (flagged for review on every import)
+    <label>Dad — Swish number, flagged for review on every import
       <input id="mDad" autocapitalize="off" value="${CONF.meta.dadSwish || ''}"></label>
     <div class="sheet-act"><button class="btn pri" id="confClose">Done</button></div>
   </div></div>`);
@@ -440,18 +652,16 @@ function openConfig() {
 }
 
 function drawConfig() {
-  const host = document.getElementById('confList');
-  if (!host) return;
+  const host = $('confList'); if (!host) return;
   host.innerHTML = '';
   for (const [g, list] of groups()) {
-    const box = el(`<div class="cgrp"><div class="cgrp-h"><b>${g}</b>
-      <span class="num">${list.length} labels</span></div><div class="cgrp-b"></div>
-      <div class="addrow sub"><input placeholder="New label in ${g}"><button class="btn">Add</button></div></div>`);
+    const box = el(`<div class="cgrp"><div class="cgrp-h"><b>${g}</b><span class="num">${list.length} labels</span></div>
+      <div class="cgrp-b"></div>
+      <div class="addrow subrow"><input placeholder="New label in ${g}"><button class="btn">Add</button></div></div>`);
     const body = box.querySelector('.cgrp-b');
     for (const c of list) {
       const used = ruleCount(c.group, c.label);
-      const row = el(`<div class="crow">
-        <input class="cname" value="${c.label.replace(/"/g, '&quot;')}">
+      const row = el(`<div class="crow"><input class="cname" value="${c.label.replace(/"/g, '&quot;')}">
         <label class="mini"><input type="checkbox" class="cfix" ${c.fixed ? 'checked' : ''}> Fixed</label>
         <span class="cuse num">${used ? used + ' in use' : 'unused'}</span>
         <button class="cdel" title="Delete">&times;</button></div>`);
@@ -473,7 +683,7 @@ function drawConfig() {
       };
       body.appendChild(row);
     }
-    const addI = box.querySelector('.addrow.sub input'), addB = box.querySelector('.addrow.sub button');
+    const addI = box.querySelector('.addrow.subrow input'), addB = box.querySelector('.addrow.subrow button');
     addB.onclick = () => {
       const l = addI.value.trim();
       if (!l) return;
@@ -485,18 +695,26 @@ function drawConfig() {
   }
 }
 
+/* ---------------------------------------------------------- settings ----- */
+$('setBtn').onclick = () => {
+  if (cfg) { $('cfgOwner').value = cfg.owner; $('cfgRepo').value = cfg.repo; $('cfgToken').value = cfg.token; }
+  $('setMsg').textContent = ''; $('setModal').hidden = false;
+};
+$('setClose').onclick = () => $('setModal').hidden = true;
+$('setForget').onclick = () => { localStorage.removeItem(CFG_KEY); location.reload(); };
+$('setSave').onclick = async () => {
+  const next = { owner: $('cfgOwner').value.trim(), repo: $('cfgRepo').value.trim(), token: $('cfgToken').value.trim() };
+  if (!next.owner || !next.repo || !next.token) { $('setMsg').className = 'msg bad'; $('setMsg').textContent = 'All three fields are needed.'; return; }
+  $('setMsg').className = 'msg'; $('setMsg').textContent = 'Connecting…';
+  cfg = next;
+  try {
+    await connect();
+    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+    $('setModal').hidden = true; banner(''); boot();
+  } catch (e) { $('setMsg').className = 'msg bad'; $('setMsg').textContent = e.message; setSync('err', 'error'); }
+};
+
 /* -------------------------------------------------------------- wiring --- */
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => setTab(t.dataset.t));
-function setTab(t) {
-  tab = t;
-  document.querySelectorAll('.tab').forEach(x => x.setAttribute('aria-pressed', x.dataset.t === t));
-  $('panelPersonal').hidden = t !== 'personal';
-  $('panelCorp').hidden = t !== 'corp';
-  $('panelSwish').hidden = t !== 'swish';
-  $('toolsPersonal').style.display = t === 'personal' ? '' : 'none';
-  if (t === 'corp') renderCorp();
-  if (t === 'swish') renderSwish();
-}
 document.querySelectorAll('.chip[data-f]').forEach(c => c.onclick = () => {
   filter = c.dataset.f;
   document.querySelectorAll('.chip[data-f]').forEach(x => x.setAttribute('aria-pressed', x === c));
@@ -515,18 +733,16 @@ addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.retur
 
 /* ---------------------------------------------------------------- boot --- */
 function boot() {
-  document.getElementById('confBtn').hidden = false;
-  const span = ledger.transactions.length
-    ? ` ${ledger.transactions[0].date.slice(0, 7)} → ${ledger.transactions.at(-1).date.slice(0, 7)}`
-    : '';
-  $('win').textContent = span;
-  render(); renderCorp(); setTab('personal');
+  const tx = ledger.transactions;
+  $('win').textContent = tx.length ? ` ${tx[0].date.slice(0, 7)} → ${tx.at(-1).date.slice(0, 7)}` : '';
+  $('confBtn').hidden = false;
+  go(unconfirmed() ? 'categorise' : 'control');
 }
 
 (async function init() {
   try { cfg = JSON.parse(localStorage.getItem(CFG_KEY) || 'null'); } catch { cfg = null; }
   if (!cfg) {
-    banner('Not connected yet. Open <b>Settings</b> and enter your GitHub username, the data repository name, and your access token.', 'fatal');
+    banner('Not connected yet. Open <b>Settings</b> and enter your GitHub username, the data repository name, and your access token.');
     setSync('err', 'not set up');
     return;
   }
