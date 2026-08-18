@@ -87,6 +87,15 @@ export function clean(s) {
 
 const SWB_ACCOUNTS = { '9232740481': 'swb_priv', '9139972534': 'swb_spar' };
 
+/** The junk first line of a Swedbank export declares its own window:
+    "* Transaktioner Period 2026-02-01–2026-02-28 …". This is authoritative and
+    answers what transaction dates cannot — February's rows run 02-02 to 02-27,
+    but the export covers the whole month. Amex has no equivalent. */
+export function declaredPeriod(text) {
+  const m = text.match(/Period\s*(\d{4}-\d{2}-\d{2})\s*[–\-—]\s*(\d{4}-\d{2}-\d{2})/);
+  return m ? { from: m[1], to: m[2], basis: 'declared' } : null;
+}
+
 export function parseSwedbank(text) {
   const rows = parseCSV(text);
   const head = rows.findIndex(r => r[0] === 'Radnummer');
@@ -104,7 +113,7 @@ export function parseSwedbank(text) {
       });
     } catch (e) { rejects.push({ row: r, why: e.message }); }
   }
-  return { rows: out, rejects, source: 'swedbank' };
+  return { rows: out, rejects, source: 'swedbank', period: declaredPeriod(text) };
 }
 
 /** Amex reports charges as POSITIVE. We normalise to Swedbank's convention:
@@ -128,7 +137,9 @@ export function parseAmex(text) {
       });
     } catch (e) { rejects.push({ row: r, why: e.message }); }
   }
-  return { rows: out, rejects, source: 'amex', account };
+  const dates = out.map(r => r.date).sort();
+  return { rows: out, rejects, source: 'amex', account,
+           period: dates.length ? { from: dates[0], to: dates.at(-1), basis: 'inferred' } : null };
 }
 
 export function parseFile(text) {
@@ -314,4 +325,75 @@ export class Repo {
     if (r.status === 404) return 'Not found (404). Check the owner and repository name, and that the token can see it.';
     return `GitHub error ${r.status}. ${d}`;
   }
+}
+
+
+/* ------------------------------------------------------------- coverage -- */
+
+/** Coverage windows per account, merged and sorted. Declared windows beat
+    inferred ones for the same span. */
+export function mergeCoverage(existing, additions) {
+  const out = [...(existing || [])];
+  for (const a of additions) {
+    if (!a || !a.account) continue;
+    const same = out.find(x => x.account === a.account && x.from === a.from && x.to === a.to);
+    if (same) { if (a.basis === 'declared') same.basis = 'declared'; continue; }
+    out.push({ ...a });
+  }
+  return out.sort((x, y) => x.account === y.account ? (x.from < y.from ? -1 : 1) : (x.account < y.account ? -1 : 1));
+}
+
+/** Per account: earliest start, latest end, and whether any window was declared. */
+export function coverageByAccount(cov, tx) {
+  const acc = {};
+  for (const c of cov || []) {
+    const a = acc[c.account] ||= { from: c.from, to: c.to, declared: false };
+    if (c.from < a.from) a.from = c.from;
+    if (c.to > a.to) a.to = c.to;
+    if (c.basis === 'declared') a.declared = true;
+  }
+  for (const t of tx) {                      // fall back to transaction extents
+    const a = acc[t.account] ||= { from: t.date, to: t.date, declared: false };
+    if (t.date < a.from) a.from = t.date;
+    if (t.date > a.to) a.to = t.date;
+  }
+  return acc;
+}
+
+/** A month is complete only when EVERY tracked account covers its final day.
+    That is the boundary beyond which comparisons are not trustworthy. */
+export function completeMonths(cov, tx, trackedAccounts) {
+  const acc = coverageByAccount(cov, tx);
+  const present = trackedAccounts.filter(a => acc[a]);
+  if (!present.length) return [];
+  const start = present.map(a => acc[a].from).sort().at(-1).slice(0, 7);
+  const end = present.map(a => acc[a].to).sort()[0];
+  const months = [];
+  let [y, m] = start.split('-').map(Number);
+  for (;;) {
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    const last = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    if (last > end) break;
+    months.push(key);
+    if (++m > 12) { m = 1; y++; }
+  }
+  return months;
+}
+
+/* ------------------------------------------------------ near-duplicates -- */
+
+/** Fingerprints catch an identical row sent twice. They cannot catch the same
+    purchase arriving twice with different details — an Amex charge that settled
+    at a different amount or date than when it was pending. Surface, never merge. */
+export function nearDuplicates(existing, incoming) {
+  const day = 864e5, hits = [];
+  for (const n of incoming) {
+    const nd = Date.parse(n.date);
+    const m = existing.find(e => e.account === n.account && e.fp !== n.fp &&
+      e.merchant.slice(0, 14) === n.merchant.slice(0, 14) &&
+      Math.abs(Date.parse(e.date) - nd) <= 5 * day &&
+      Math.abs(Math.abs(e.amount) - Math.abs(n.amount)) / Math.max(Math.abs(n.amount), 1) <= 0.02);
+    if (m) hits.push({ incoming: n, existing: m });
+  }
+  return hits;
 }
