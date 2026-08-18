@@ -1,20 +1,25 @@
 import * as C from './core.js';
 
 /* ------------------------------------------------------------- state ----- */
-const CATS = {
- 'Food & Drinks':['Groceries','Restaurant','Alcohol','Coffee & snacks'],
- 'Transport':['Taxi','Scooters & bikes','Public transport','Fuel','Parking','Other transport'],
- 'Shopping':['Clothing','Home & furniture','Other shopping'],
- 'Lifestyle':['Entertainment','Golf','Surf','Ski','Subscriptions','Other lifestyle'],
- 'Health':['Beauty','Sport & fitness','Memberships','Pharmacy','Healthcare'],
- 'Travel':['Hotel','Flight','Car rental','Other travel'],
- 'Housing':['Rent/Avgift','Electricity','Internet & phone','Other housing'],
- 'Fees & Debt':['Mortgage','CSN','Bank & card fees','FX costs'],
- 'Insurance':['Home & contents','A-kassa','Other insurance'],
-};
+/* Taxonomy, accounts and thresholds are DATA, not program logic.
+   They live in config.json in the private repo and are edited in-app.
+   The list below is only a fallback for a repo that has no config yet. */
+const FALLBACK_CATS = [
+  ['Food & Drinks',['Groceries','Restaurant','Alcohol','Coffee & snacks']],
+  ['Transport',['Taxi','Scooters & bikes','Public transport','Fuel','Parking','Other transport']],
+  ['Shopping',['Clothing','Home & furniture','Other shopping']],
+  ['Lifestyle',['Entertainment','Golf','Surf','Ski','Subscriptions','Other lifestyle']],
+  ['Health',['Beauty','Sport & fitness','Memberships','Pharmacy','Healthcare']],
+  ['Travel',['Hotel','Flight','Car rental','Other travel']],
+  ['Housing',['Rent/Avgift','Electricity','Internet & phone','Other housing']],
+  ['Fees & Debt',['Mortgage','CSN','Bank & card fees','FX costs']],
+  ['Insurance',['Home & contents','A-kassa','Other insurance']],
+].flatMap(([group, labels]) => labels.map(label => ({ group, label, fixed: false })));
+
 const CFG_KEY = 'ledger.cfg';
 
 let cfg = null, repo = null;
+let CONF = null, shaC = null, confDirty = false;
 let ledger = null, ann = null, shaL = null, shaA = null;
 let dirty = false, tab = 'personal', filter = 'todo', sort = 'value', query = '';
 let pendingImport = null;
@@ -23,6 +28,13 @@ const $ = id => document.getElementById(id);
 const el = h => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
 const kr = n => Math.round(n).toLocaleString('sv-SE') + ' kr';
 const cat = r => r && r.group ? r.group + ' / ' + r.label : '';
+const groups = () => {
+  const g = new Map();
+  for (const c of CONF.categories) { if (!g.has(c.group)) g.set(c.group, []); g.get(c.group).push(c); }
+  return g;
+};
+const defaultFixed = (g, l) => !!CONF.categories.find(c => c.group === g && c.label === l)?.fixed;
+const ruleCount = (g, l) => Object.values(ann.merchantRules).filter(r => r.group === g && r.label === l).length;
 
 /* ------------------------------------------------------------ derived ---- */
 // Spending rows are everything personal: card + bank purchases, fees, and
@@ -56,8 +68,14 @@ async function connect() {
   setSync('busy', 'loading');
   const L = await repo.read('ledger.json');
   const A = await repo.read('annotations.json');
-  if (!L) throw new Error('ledger.json not found in ' + cfg.repo + '. Upload the seed files first.');
+  const K = await repo.read('config.json');
+  CONF = K ? K.json : { version: 1, categories: FALLBACK_CATS, meta: {}, accounts: [] };
+  shaC = K ? K.sha : null;
+  if (!CONF.categories?.length) CONF.categories = FALLBACK_CATS;
+  if (!L) throw new Error(`ledger.json not found in ${cfg.owner}/${cfg.repo}. Either the file is missing, or the token cannot see that repository — GitHub returns the same 404 for both. Check the repo name and that the token lists it under Repository access.`);
   ledger = L.json; shaL = L.sha;
+  CONF.meta = { ...(ledger.meta || {}), ...(CONF.meta || {}) };
+  if (!CONF.accounts?.length) CONF.accounts = ledger.accounts || [];
   ann = A ? A.json : { version: 1, merchantRules: {}, swishNames: {}, workExpenses: {}, corporatePrivate: {} };
   shaA = A ? A.sha : null;
   for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate']) ann[k] ||= {};
@@ -70,6 +88,11 @@ async function save() {
   try {
     ann.updated = new Date().toISOString();
     shaA = await repo.write('annotations.json', ann, shaA, 'Update annotations');
+    if (confDirty) {
+      CONF.updated = new Date().toISOString();
+      shaC = await repo.write('config.json', CONF, shaC, 'Update configuration');
+      confDirty = false;
+    }
     if (pendingImport === 'saved-ledger') pendingImport = null;
     dirty = false; setSync('on', 'synced'); toast('Saved to GitHub');
   } catch (e) { setSync('err', 'error'); banner(e.message); }
@@ -176,9 +199,9 @@ function paintGauge() {
 function optionsFor(sel) {
   let h = '<option value="">— pick a category —</option>';
   h += `<option value="Unknown / Unknown"${sel === 'Unknown / Unknown' ? ' selected' : ''}>Unknown — decide later</option>`;
-  for (const g in CATS) {
+  for (const [g, list] of groups()) {
     h += `<optgroup label="${g}">`;
-    for (const l of CATS[g]) { const v = g + ' / ' + l; h += `<option value="${v}"${v === sel ? ' selected' : ''}>${l}</option>`; }
+    for (const c of list) { const v = g + ' / ' + c.label; h += `<option value="${v}"${v === sel ? ' selected' : ''}>${c.label}</option>`; }
     h += '</optgroup>';
   }
   return h;
@@ -212,7 +235,9 @@ function card(m) {
 
   n.querySelector('.pick').onchange = e => {
     const [g, l] = (e.target.value || ' / ').split(' / ');
-    r.group = g || null; r.label = l || null; markDirty();
+    r.group = g || null; r.label = l || null;
+    if (g) { r.fixed = defaultFixed(g, l); n.querySelector('.fix').checked = r.fixed; }
+    markDirty();
   };
   n.querySelector('.fix').onchange = e => { r.fixed = e.target.checked; markDirty(); };
   n.querySelector('.ok-btn').onclick = () => {
@@ -368,6 +393,98 @@ function renderSwish() {
   }
 }
 
+
+/* ------------------------------------------------------- config editor --- */
+/* Categories and settings are yours to change without a deploy. Renaming a
+   label rewrites every merchant rule that points at it, so nothing is
+   orphaned; deleting one is refused while rules still use it. */
+
+const confBtn = el('<button class="btn" id="confBtn" hidden>Categories</button>');
+document.querySelector('.acts').insertBefore(confBtn, document.getElementById('setBtn'));
+confBtn.onclick = openConfig;
+
+function openConfig() {
+  if (!CONF || !ann) return toast('Connect first');
+  document.getElementById('confModal')?.remove();
+  const m = el(`<div class="modal" id="confModal"><div class="sheet wide">
+    <h2>Categories &amp; settings</h2>
+    <p class="lede">Stored in <b>config.json</b> in your private repo. Changes take effect immediately;
+      press <b>Save</b> in the header to commit them.</p>
+    <div id="confList"></div>
+    <div class="addrow">
+      <input id="newGroup" placeholder="New group name" autocapitalize="words">
+      <button class="btn" id="addGroup">Add group</button>
+    </div>
+    <h3 class="sh">Settings</h3>
+    <label>Opening receivable at ${CONF.meta.openingDate || 'start'} (kr)
+      <input id="mOpen" inputmode="numeric" value="${CONF.meta.openingReceivable ?? ''}"></label>
+    <label>Dad — Swish number (flagged for review on every import)
+      <input id="mDad" autocapitalize="off" value="${CONF.meta.dadSwish || ''}"></label>
+    <div class="sheet-act"><button class="btn pri" id="confClose">Done</button></div>
+  </div></div>`);
+  document.body.appendChild(m);
+  m.querySelector('#confClose').onclick = () => {
+    const o = parseFloat(m.querySelector('#mOpen').value);
+    if (isFinite(o)) CONF.meta.openingReceivable = o;
+    CONF.meta.dadSwish = m.querySelector('#mDad').value.trim();
+    confDirty = true; markDirty(); m.remove();
+  };
+  m.querySelector('#addGroup').onclick = () => {
+    const g = m.querySelector('#newGroup').value.trim();
+    if (!g) return;
+    if (groups().has(g)) return toast('That group already exists');
+    CONF.categories.push({ group: g, label: 'Other ' + g.toLowerCase(), fixed: false });
+    confDirty = true; markDirty(); drawConfig();
+  };
+  drawConfig();
+}
+
+function drawConfig() {
+  const host = document.getElementById('confList');
+  if (!host) return;
+  host.innerHTML = '';
+  for (const [g, list] of groups()) {
+    const box = el(`<div class="cgrp"><div class="cgrp-h"><b>${g}</b>
+      <span class="num">${list.length} labels</span></div><div class="cgrp-b"></div>
+      <div class="addrow sub"><input placeholder="New label in ${g}"><button class="btn">Add</button></div></div>`);
+    const body = box.querySelector('.cgrp-b');
+    for (const c of list) {
+      const used = ruleCount(c.group, c.label);
+      const row = el(`<div class="crow">
+        <input class="cname" value="${c.label.replace(/"/g, '&quot;')}">
+        <label class="mini"><input type="checkbox" class="cfix" ${c.fixed ? 'checked' : ''}> Fixed</label>
+        <span class="cuse num">${used ? used + ' in use' : 'unused'}</span>
+        <button class="cdel" title="Delete">&times;</button></div>`);
+      row.querySelector('.cname').onchange = e => {
+        const to = e.target.value.trim();
+        if (!to) { e.target.value = c.label; return; }
+        if (list.some(x => x !== c && x.label === to)) { e.target.value = c.label; return toast('That label already exists here'); }
+        const from = c.label;
+        Object.values(ann.merchantRules).forEach(r => { if (r.group === g && r.label === from) r.label = to; });
+        Object.values(ann.corporatePrivate).forEach(r => { if (r.group === g && r.label === from) r.label = to; });
+        c.label = to; confDirty = true; markDirty(); drawConfig(); render();
+        toast(used ? `Renamed — ${used} merchant rule(s) updated` : 'Renamed');
+      };
+      row.querySelector('.cfix').onchange = e => { c.fixed = e.target.checked; confDirty = true; markDirty(); };
+      row.querySelector('.cdel').onclick = () => {
+        if (used) return toast(`Still used by ${used} merchant(s) — move them first`);
+        CONF.categories = CONF.categories.filter(x => x !== c);
+        confDirty = true; markDirty(); drawConfig();
+      };
+      body.appendChild(row);
+    }
+    const addI = box.querySelector('.addrow.sub input'), addB = box.querySelector('.addrow.sub button');
+    addB.onclick = () => {
+      const l = addI.value.trim();
+      if (!l) return;
+      if (list.some(x => x.label === l)) return toast('That label already exists here');
+      CONF.categories.push({ group: g, label: l, fixed: false });
+      confDirty = true; markDirty(); drawConfig();
+    };
+    host.appendChild(box);
+  }
+}
+
 /* -------------------------------------------------------------- wiring --- */
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => setTab(t.dataset.t));
 function setTab(t) {
@@ -398,6 +515,7 @@ addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.retur
 
 /* ---------------------------------------------------------------- boot --- */
 function boot() {
+  document.getElementById('confBtn').hidden = false;
   const span = ledger.transactions.length
     ? ` ${ledger.transactions[0].date.slice(0, 7)} → ${ledger.transactions.at(-1).date.slice(0, 7)}`
     : '';
