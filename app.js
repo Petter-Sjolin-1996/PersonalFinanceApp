@@ -1,4 +1,4 @@
-import * as C from './core.js?v=12';
+import * as C from './core.js?v=13';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -916,6 +916,48 @@ function renderSwish() {
   }
 }
 
+
+/* --------------------------------------------------- subscriptions ------ */
+function drawSubs() {
+  const months = complete().slice(-12);
+  const host = $('viewSubs');
+  if (!months.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3></div>'; return; }
+  // Must-have recurring items — rent, energy, a-kassa — are not decisions,
+  // so they would only crowd out the things you can actually act on.
+  const all = recurring(months).filter(r => r.tier !== 'Must have');
+  const subs = all.filter(r => r.kind === 'subscription');
+  const habits = all.filter(r => r.kind === 'habit');
+  const yr = list => list.reduce((a, r) => a + r.perYear, 0);
+  const table = (list, empty) => list.length ? `<div class="tgt">
+      <div class="sub-h"><span>Merchant</span><span>Category</span><span>Per month</span><span>Per year</span></div>
+      ${list.map(r => `<div class="sub-r"><b>${r.merchant}</b>
+        <span class="sc">${r.cat}<span class="tag tt${TIERS.indexOf(r.tier)}">${r.tier}</span></span>
+        <span class="v">${krN(r.mean)}</span><span class="v strong">${krN(r.perYear)}</span></div>`).join('')}
+    </div>` : `<p class="lede">${empty}</p>`;
+
+  host.innerHTML = `
+    <p class="lede">Detected automatically from your ledger: anything appearing in most of the last
+      ${months.length} months. Must-have costs such as rent, energy and a-kassa are left out —
+      they recur, but they are not choices. Nothing to label here.</p>
+    <div class="kpi">
+      <div class="stat big"><b>Subscriptions</b><span>${krN(yr(subs))} kr</span>
+        <small>per year across ${subs.length} merchants · ${krN(yr(subs) / 12)} kr a month</small></div>
+      <div class="stat"><b>Recurring habits</b><span>${krN(yr(habits))} kr</span>
+        <small>per year across ${habits.length} merchants</small></div>
+    </div>
+
+    <h3 class="sh">Subscriptions — same amount every month</h3>
+    <p class="lede">These renew whether you use them or not. One decision each, and it saves every month after.</p>
+    ${table(subs, 'None detected.')}
+
+    <h3 class="sh">Habits — recurring, but the amount varies</h3>
+    <p class="lede">Not cancellable, but visible. These are choices you make repeatedly rather than once.</p>
+    ${table(habits, 'None detected.')}
+    <p class="note">A merchant counts as recurring when it appears in at least
+      ${Math.ceil(months.length * ((CONF.meta.recurring || {}).minMonthsShare ?? 0.6))} of ${months.length} months.
+      It is a subscription when the monthly amount barely moves, a habit when it swings.
+      Move something in or out of this list by changing its category under Categorise, or its tier under Categories.</p>`;
+}
 
 /* ------------------------------------------------- transfers & income --- */
 const COUNTS = [['expenditure','Expenditure'],['income','Income'],['savings','Savings'],
