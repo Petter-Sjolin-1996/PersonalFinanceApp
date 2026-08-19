@@ -1,4 +1,4 @@
-import * as C from './core.js?v=20';
+import * as C from './core.js?v=21';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -529,20 +529,25 @@ function squarify(items, x, y, w, h, out = []) {
                      : squarify(items.slice(row.length), x, y + len, w, h - len, out);
 }
 
-/** Deviation against the label's own average, clamped, mapped to a colour.
-    Red is spending more than usual, green less — the opposite of a stock
-    heatmap, because here up is the thing to worry about. */
-function devColour(now, avg) {
-  if (!avg) return { bg: '#8E9BAA', fg: '#fff', pct: null };
-  const d = (now - avg) / avg;
-  const k = Math.max(-1, Math.min(1, d / 0.6));
-  const stops = [
-    [-1, '#1E7A4C'], [-0.5, '#4FA97B'], [-0.15, '#A8CDB8'],
-    [0.15, '#E4B4AE'], [0.5, '#CF6B5C'], [1, '#A32B1C'],
-  ];
-  const hit = stops.find(sq => k <= sq[0]) || stops.at(-1);
-  const dark = Math.abs(k) > 0.4;
-  return { bg: hit[1], fg: dark ? '#fff' : '#0E2436', pct: Math.round(d * 100) };
+/* Muted, harmonised palette. Colour identifies the category, and the order is
+   fixed by the taxonomy rather than by size, so a category keeps its colour
+   from one month to the next. */
+const PALETTE = ['#2B4C6F','#3F6F70','#7A6A5D','#4E7A5E','#6B5A72','#5A6E82',
+                 '#8A6A5C','#6E7350','#8E7B93','#4A6A85','#94806A','#66707A'];
+function catColour(group) {
+  const order = [...new Set(CONF.categories.map(c => c.group))];
+  const extra = ['Swish (net)', 'Unknown', 'Uncategorised transfers'];
+  const all = [...order, ...extra.filter(e => !order.includes(e))];
+  const i = all.indexOf(group);
+  return PALETTE[(i < 0 ? all.length : i) % PALETTE.length];
+}
+/** Lighten a hex colour towards white by t (0..1). Used to separate the labels
+    inside one category without introducing a second colour scale. */
+function lighten(hex, t) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const m = v => Math.round(v + (255 - v) * t);
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
 }
 
 /* ==================================================== MONTH DEEP-DIVE ==== */
@@ -586,33 +591,33 @@ function drawMonth() {
 
     <div class="insight">${insightFor(m, items, window12)}</div>
 
-    <div class="legend legend2"><span>Against each label's own average</span>
-      ${[['#1E7A4C','−60%'],['#4FA97B',''],['#A8CDB8',''],['#E4B4AE',''],['#CF6B5C',''],['#A32B1C','+60%']]
-        .map(([c, l]) => `<span class="lg"><i style="background:${c}"></i>${l}</span>`).join('')}</div>
     <div class="tmap">${(() => {
       const boxes = squarify(cols.map(c => ({ ...c, v: c.total })), 0, 0, 1000, 560);
       return boxes.map(b => {
         const labs = Object.values(b.labels).sort((a, l) => l.v - a.v).map(l => ({ ...l, v: l.v }));
+        const base = catColour(b.group);
         const head = Math.min(20, b.h * 0.16);
         const inner = squarify(labs, b.x + 1, b.y + head, Math.max(b.w - 2, 1), Math.max(b.h - head - 1, 1));
         return `<div class="tgrp" style="left:${b.x / 10}%;top:${b.y / 5.6}%;width:${b.w / 10}%;height:${b.h / 5.6}%">
             <span class="tgh">${b.group} <em>${krN(b.total)}</em></span></div>` +
-          inner.map(t => {
-            const avg = avgLabel(t.label);
-            const col = devColour(t.v, avg);
-            const showName = t.w > 68 && t.h > 26;
-            const showVal = t.w > 68 && t.h > 46;
-            return `<button class="tile" style="left:${t.x / 10}%;top:${t.y / 5.6}%;width:${t.w / 10}%;height:${t.h / 5.6}%;background:${col.bg};color:${col.fg}"
+          inner.map((t, k) => {
+            const shade = lighten(base, Math.min(0.42, k * 0.11));
+            const light = k * 0.11 > 0.24;
+            const showName = t.w > 62 && t.h > 24;
+            const showVal = t.w > 62 && t.h > 44;
+            const one = t.fps.every(fp => ann.oneOffs[fp]) ? ' one' : '';
+            return `<button class="tile${one}" style="left:${t.x / 10}%;top:${t.y / 5.6}%;width:${t.w / 10}%;height:${t.h / 5.6}%;background:${shade};color:${light ? '#132A3E' : '#fff'}"
               data-g="${encodeURIComponent(b.group)}" data-l="${encodeURIComponent(t.label)}"
-              title="${t.label} — ${krN(t.v)} kr${col.pct !== null ? `, ${col.pct > 0 ? '+' : ''}${col.pct}% against its average` : ''}">
+              title="${t.label} — ${krN(t.v)} kr">
               ${showName ? `<b>${t.label}</b>` : ''}${showVal ? `<i>${krN(t.v)}</i>` : ''}</button>`;
           }).join('');
       }).join('');
     })()}</div>
+    <div class="catkey">${cols.map(c => `<span class="ck">
+      <i style="background:${catColour(c.group)}"></i>${c.group} <em>${krN(c.total)}</em></span>`).join('')}</div>
     <p class="note">Every label in the month, sized by amount and grouped into its category.
-      Colour is that label against its own ${window12.length}-month average — red is more than usual,
-      green is less, so the eye goes to what changed rather than to what is merely big.
-      Tap any tile for its transactions.</p>`;
+      Shades within a block separate the labels. Tap any tile for its transactions;
+      a tile marked with a dot is flagged as a one-off.</p>`;
 
   $('mPrev').onclick = () => { monthCursor--; drawMonth(); };
   $('mNext').onclick = () => { monthCursor++; drawMonth(); };
@@ -666,19 +671,19 @@ function openSeg(m, group, label) {
     if (t.date.slice(0, 7) !== m || skip.has(t.ref)) return false;
     if (isSpendRow(t)) {
       const r = ann.merchantRules[mkey(t)] || {};
-      return !ann.workExpenses[t.fp] && (r.group || 'Unknown') === group && (r.label || 'Unlabelled') === label;
+      return (r.group || 'Unknown') === group && (r.label || 'Unlabelled') === label;
     }
     if (isPersonSwish(t)) return group === 'Swish (net)' && (ann.swishNames[t.ref] || t.ref) === label;
     if (isOther(t)) { const f = flowOf(t); return f.counts === 'expenditure' && f.group === group && f.label === label; }
     return false;
   }).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
-  const sum = rows.reduce((a, t) => a + Math.abs(t.amount), 0);
+  const sum = rows.filter(t => !ann.workExpenses[t.fp]).reduce((a, t) => a + Math.abs(t.amount), 0);
 
   const mod = el(`<div class="modal" id="segModal"><div class="sheet">
     <div class="dhead"><div><h2>${label}</h2>
       <p class="dsum">${group} · ${rows.length} transaction${rows.length > 1 ? 's' : ''} · <b>${krN(sum)} kr</b></p></div>
       <button class="xclose" aria-label="Close">&times;</button></div>
-    <div class="seglist">${rows.map(t => `<div class="segr" data-fp="${t.fp}">
+    <div class="seglist">${rows.map(t => `<div class="segr${ann.oneOffs[t.fp] ? ' isone' : ''}${ann.workExpenses[t.fp] ? ' iswork' : ''}" data-fp="${t.fp}">
       <span class="sd">${t.date.slice(5)}</span>
       <span class="sm" title="${t.merchant}">${t.merchant}</span>
       <span class="sv num">${kr(t.amount)}</span>
@@ -698,9 +703,11 @@ function openSeg(m, group, label) {
   mod.querySelectorAll('.segr').forEach(r => {
     const fp = r.dataset.fp;
     r.querySelector('.fo').onchange = e => {
-      if (e.target.checked) ann.oneOffs[fp] = true; else delete ann.oneOffs[fp]; markDirty(); };
+      if (e.target.checked) ann.oneOffs[fp] = true; else delete ann.oneOffs[fp];
+      r.classList.toggle('isone', !!ann.oneOffs[fp]); markDirty(); };
     r.querySelector('.fw').onchange = e => {
-      if (e.target.checked) ann.workExpenses[fp] = true; else delete ann.workExpenses[fp]; markDirty(); };
+      if (e.target.checked) ann.workExpenses[fp] = true; else delete ann.workExpenses[fp];
+      r.classList.toggle('iswork', !!ann.workExpenses[fp]); markDirty(); };
   });
   mod.querySelector('#segCat')?.addEventListener('change', e => {
     const [g, l] = (e.target.value || ' / ').split(' / ');
