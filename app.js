@@ -1,4 +1,4 @@
-import * as C from './core.js?v=6';
+import * as C from './core.js?v=7';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -19,7 +19,8 @@ const CFG_KEY = 'ledger.cfg';
 const SECTIONS = {
   control:      [['overview','Overview'], ['targets','Targets']],
   transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
-  categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'], ['swish','Swish counterparties']],
+  categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'],
+                 ['swish','Swish counterparties'], ['other','Transfers & income']],
 };
 
 let cfg = null, repo = null;
@@ -94,6 +95,34 @@ const isSpendRow = t =>
     Excluded by design — transfers between your own accounts, Avanza (that is
     saving, not spending), Amex invoice payments (the charges themselves are
     already counted), and any account listed in meta.excludeFromCashflow. */
+/* Rows that are neither merchant spending nor person-to-person Swish get
+   classified here: salary, reimbursements, obligations, savings transfers,
+   wallet loads and stray credits. Each carries a default, a rule by
+   counterparty, and a per-transaction override. */
+const OTHER_ROLES = ['income','reimbursement','transfer_obligation','transfer_savings','wallet_load','reversal'];
+const isOther = t => OTHER_ROLES.includes(t.role) && !isSpendRow(t)
+  && !(t.role === 'reversal' && t.account.startsWith('amex'));
+
+function otherKey(t) {
+  if (t.role === 'income') return 'Salary';
+  if (t.role === 'reimbursement') return 'McKinsey reimbursements';
+  return t.ref || t.desc;
+}
+const DEFAULT_COUNTS = { income: 'income', reimbursement: 'ignore', transfer_obligation: 'expenditure',
+  transfer_savings: 'savings', wallet_load: 'ignore', reversal: 'ignore' };
+
+/** How a row behaves in the cash-flow view. Per-transaction beats the
+    counterparty rule, which beats the role default. */
+function flowOf(t) {
+  const o = ann.txOverrides[t.fp] || {};
+  const r = ann.transferRules[otherKey(t)] || {};
+  return {
+    counts: o.counts || r.counts || DEFAULT_COUNTS[t.role] || 'ignore',
+    group: o.group ?? r.group ?? null,
+    label: o.label ?? r.label ?? null,
+  };
+}
+
 function excludedRefs() {
   const ids = CONF.meta.excludeFromCashflow || [];
   return new Set((CONF.accounts || []).filter(a => ids.includes(a.id)).map(a => a.match?.ref).filter(Boolean));
@@ -108,10 +137,13 @@ function cashByMonth(months) {
     if (!out[m]) continue;
     if (skip.has(t.ref)) continue;
     if (adjust && ann.oneOffs[t.fp]) continue;
-    if (t.role === 'income') out[m].income += t.amount;
-    else if (isSpendRow(t)) { if (!ann.workExpenses[t.fp]) out[m].spend += Math.abs(t.amount); }
-    else if (t.role === 'transfer_obligation') out[m].spend += Math.abs(t.amount);
+    if (isSpendRow(t)) { if (!ann.workExpenses[t.fp]) out[m].spend += Math.abs(t.amount); }
     else if (t.role === 'p2p') out[m].spend -= t.amount;      // net: sent adds, received subtracts
+    else if (isOther(t)) {
+      const f = flowOf(t);
+      if (f.counts === 'income') out[m].income += Math.abs(t.amount);
+      else if (f.counts === 'expenditure') out[m].spend -= t.amount;   // signed: a refund reduces it
+    }
   }
   for (const m of months) out[m].net = out[m].income - out[m].spend;
   return out;
@@ -137,6 +169,16 @@ const corpUnreviewed = () => {
 const swishRefs = () => [...new Set(ledger.transactions
   .filter(t => t.role === 'p2p' && (t.ref || '').startsWith('+46')).map(t => t.ref))];
 const swishUnnamed = () => swishRefs().filter(r => !ann.swishNames[r]).length;
+const otherGroups = () => {
+  const g = new Map();
+  for (const t of ledger.transactions.filter(isOther)) {
+    const k = otherKey(t);
+    const e = g.get(k) || { key: k, n: 0, total: 0, tx: [] };
+    e.n++; e.total += t.amount; e.tx.push(t); g.set(k, e);
+  }
+  return [...g.values()].sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
+};
+const otherUnruled = () => otherGroups().filter(g => !ann.transferRules[g.key]?.confirmed).length;
 
 /* -------------------------------------------------------------- sync ----- */
 function setSync(state, text) { const s = $('sync'); s.className = 'sync ' + state; s.textContent = text; }
@@ -161,7 +203,7 @@ async function connect() {
   if (!CONF.accounts?.length) CONF.accounts = ledger.accounts || [];
   ann = A ? A.json : { version: 1 };
   shaA = A ? A.sha : null;
-  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs']) ann[k] ||= {};
+  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs','transferRules','txOverrides']) ann[k] ||= {};
   dirty = false; confDirty = false; setSync('on', 'synced');
 }
 
@@ -189,7 +231,8 @@ function go(sec, p) {
 
   const sn = $('subnavIn'); sn.innerHTML = '';
   for (const [id, label] of panes) {
-    const badge = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed() : id === 'swish' ? swishUnnamed() : 0;
+    const badge = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed()
+                : id === 'swish' ? swishUnnamed() : id === 'other' ? otherUnruled() : 0;
     const b = el(`<button data-p="${id}" aria-pressed="${id === pane}">${label}
       <em ${badge ? '' : 'hidden'}>${badge}</em></button>`);
     b.onclick = () => go(sec, id);
@@ -199,18 +242,18 @@ function go(sec, p) {
 
   const show = {
     overview: 'viewControl', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
-    expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish',
+    expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish', other: 'viewOther',
   };
   for (const v of Object.values(show)) $(v).hidden = true;
   $(show[pane]).hidden = false;
   $('toolsPersonal').hidden = pane !== 'expenses';
   $('gaugeWrap').hidden = pane !== 'expenses';
 
-  const n = unconfirmed() + corpUnreviewed() + swishUnnamed();
+  const n = unconfirmed() + corpUnreviewed() + swishUnnamed() + otherUnruled();
   $('navBadge').textContent = n; $('navBadge').hidden = !n;
 
   ({ overview: drawControl, targets: drawTargets, import: drawImport, coverage: drawCoverage,
-     expenses: render, corp: renderCorp, swish: renderSwish })[pane]();
+     expenses: render, corp: renderCorp, swish: renderSwish, other: renderOther })[pane]();
 }
 document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dataset.s));
 
@@ -324,10 +367,11 @@ function breakdown(months) {
       if (ann.workExpenses[t.fp]) continue;
       const r = ann.merchantRules[mkey(t)];
       put(r?.group || 'Unknown', r?.label || 'Unlabelled', m, Math.abs(t.amount));
-    } else if (t.role === 'transfer_obligation') {
-      const who = t.ref === CONF.meta.dadSwish ? 'Dad — mortgage'
-                : accByRef[t.ref] || ann.swishNames[t.ref] || t.ref || 'Other';
-      put('Obligations', who, m, Math.abs(t.amount));
+    } else if (isOther(t)) {
+      const f = flowOf(t);
+      if (f.counts !== 'expenditure') continue;
+      const who = accByRef[t.ref] || ann.swishNames[t.ref] || otherKey(t);
+      put(f.group || 'Uncategorised transfers', f.label || who, m, -t.amount);
     } else if (t.role === 'p2p') {
       put('Swish (net)', ann.swishNames[t.ref] || t.ref, m, -t.amount);
     }
@@ -774,12 +818,84 @@ function renderSwish() {
   }
 }
 
+
+/* ------------------------------------------------- transfers & income --- */
+const COUNTS = [['expenditure','Expenditure'],['income','Income'],['savings','Savings'],['ignore','Ignore']];
+
+function renderOther() {
+  if (!ledger) return;
+  const host = $('viewOther');
+  const band = CONF.meta.mortgageBand;
+  const accByRef = Object.fromEntries((CONF.accounts || []).filter(a => a.match?.ref).map(a => [a.match.ref, a.label]));
+  host.innerHTML = `<p class="lede">Everything that is not a merchant purchase or a Swish with a person:
+    salary, reimbursements, the mortgage, transfers to savings. Set a rule per counterparty; override an
+    individual transaction where it differs.</p><div id="otherList"></div>`;
+  const list = $('otherList');
+
+  for (const g of otherGroups()) {
+    const rule = ann.transferRules[g.key] ||= { counts: null, group: null, label: null, confirmed: false };
+    const eff = rule.counts || DEFAULT_COUNTS[g.tx[0].role] || 'ignore';
+    const name = accByRef[g.key] || ann.swishNames[g.key] || g.key;
+    const odd = band ? g.tx.filter(t => t.amount < 0 && (Math.abs(t.amount) < band[0] || Math.abs(t.amount) > band[1])).length : 0;
+
+    const card = el(`<article class="m ${rule.confirmed ? 'ok' : 'todo'}">
+      <div class="m-head">
+        <div class="m-id"><div class="m-name">${name}</div>
+          <div class="m-meta"><span class="num">${g.n}&times;</span>
+            <span>${g.tx[0].date} → ${g.tx.at(-1).date}</span>
+            <span class="tag">${g.tx[0].role.replace(/_/g,' ')}</span>
+            ${odd && eff === 'expenditure' ? `<span class="tag rev">${odd} outside band</span>` : ''}</div></div>
+        <div class="m-amt num">${kr(g.total)}</div>
+        <div class="m-ctl">
+          <select class="cnt">${COUNTS.map(([v,l]) => `<option value="${v}"${v === eff ? ' selected' : ''}>Counts as ${l}</option>`).join('')}</select>
+          <select class="pick" ${eff === 'expenditure' ? '' : 'disabled'}>${optionsFor(cat(rule))}</select>
+          <button class="ok-btn">${rule.confirmed ? 'Confirmed' : 'Confirm'}</button>
+          <button class="disc">Show ${g.n} transaction${g.n > 1 ? 's' : ''}</button>
+        </div>
+      </div>
+      <div class="tx">${g.tx.slice().sort((a,b) => a.date < b.date ? 1 : -1).map(t => {
+        const o = ann.txOverrides[t.fp] || {};
+        const out = Math.abs(t.amount), flag = band && t.amount < 0 && (out < band[0] || out > band[1]);
+        return `<div class="tx-r" data-fp="${t.fp}">
+          <span class="when">${t.date}${flag ? ' <span class="tag rev">outside band</span>' : ''}</span>
+          <span class="num">${kr(t.amount)}</span>
+          <select class="ovr"><option value="">follow rule</option>
+            ${COUNTS.map(([v,l]) => `<option value="${v}"${o.counts === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
+        </div>`;
+      }).join('')}</div></article>`);
+
+    card.querySelector('.cnt').onchange = e => {
+      rule.counts = e.target.value;
+      if (rule.counts !== 'expenditure') { rule.group = rule.label = null; }
+      markDirty(); renderOther();
+    };
+    card.querySelector('.pick').onchange = e => {
+      const [gr, l] = (e.target.value || ' / ').split(' / ');
+      rule.group = gr || null; rule.label = l || null; markDirty();
+    };
+    card.querySelector('.ok-btn').onclick = () => {
+      if (!rule.counts) rule.counts = eff;
+      if (rule.counts === 'expenditure' && !rule.group) return toast('Pick a category first');
+      rule.confirmed = !rule.confirmed; markDirty(); renderOther(); refreshBadges();
+    };
+    card.querySelector('.disc').onclick = () => card.classList.toggle('open');
+    card.querySelectorAll('.ovr').forEach(sel => sel.onchange = ev => {
+      const fp = ev.target.closest('.tx-r').dataset.fp;
+      if (ev.target.value) (ann.txOverrides[fp] ||= {}).counts = ev.target.value;
+      else delete ann.txOverrides[fp];
+      markDirty();
+    });
+    list.appendChild(card);
+  }
+}
+
 function refreshBadges() {
-  const n = unconfirmed() + corpUnreviewed() + swishUnnamed();
+  const n = unconfirmed() + corpUnreviewed() + swishUnnamed() + otherUnruled();
   $('navBadge').textContent = n; $('navBadge').hidden = !n;
   document.querySelectorAll('#subnavIn button').forEach(b => {
     const id = b.dataset.p;
-    const v = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed() : id === 'swish' ? swishUnnamed() : 0;
+    const v = id === 'expenses' ? unconfirmed() : id === 'corp' ? corpUnreviewed()
+            : id === 'swish' ? swishUnnamed() : id === 'other' ? otherUnruled() : 0;
     const em = b.querySelector('em'); em.textContent = v; em.hidden = !v;
   });
 }
