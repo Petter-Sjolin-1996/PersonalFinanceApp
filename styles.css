@@ -284,3 +284,21 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
   h1{font-size:18px}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* [hidden] must beat any display rule we set on the same element */
+[hidden]{display:none!important}
+
+/* ---- income / expenditure / net flow chart ---- */
+.flow{display:flex;gap:6px;align-items:flex-end;margin-top:16px;padding-top:8px}
+.fcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;min-width:0}
+.bubble{border-radius:50%;background:var(--blue-soft);border:1.5px solid var(--blue);color:var(--blue-dk);
+  display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;
+  font-variant-numeric:tabular-nums;flex:none}
+.bubble.neg{background:#FCEDEC;border-color:var(--neg);color:var(--neg)}
+.fbars{height:150px;width:100%;display:flex;gap:3px;align-items:flex-end;justify-content:center}
+.fb{width:38%;max-width:26px;border-radius:2px 2px 0 0;min-height:2px}
+.fb.in{background:var(--navy)}
+.fb.out{background:var(--blue)}
+.note i{display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:baseline}
+.note i.sw-in{background:var(--navy)}
+.note i.sw-out{background:var(--blue)}
