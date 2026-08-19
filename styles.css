@@ -458,3 +458,33 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
   .sub-h span:nth-child(2),.sub-r .sc{display:none}
   .trow{grid-template-columns:34px 1fr 66px;gap:8px}
 }
+
+/* ---- subscriptions: cancellation, kind switch, habit history ---- */
+.sub-h,.sub-r{grid-template-columns:1fr 1fr 92px 100px 168px}
+.sub-h span:nth-child(3),.sub-h span:nth-child(4){text-align:right}
+.sub-r.tap{cursor:pointer}
+.sub-r.tap:hover{background:var(--surface)}
+.sub-r.off{opacity:.6}
+.sub-r.off b,.sub-r.off .v{text-decoration:line-through}
+.sub-r.open .chev{transform:rotate(90deg)}
+.acts2{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+.lnk{border:0;background:transparent;color:var(--blue);font:500 12px "Inter",sans-serif;cursor:pointer;padding:2px 0;white-space:nowrap}
+.lnk:hover{text-decoration:underline}
+.stat span.good{color:var(--pos)}
+
+.hist{background:var(--surface);border-bottom:1px solid var(--rule-2)}
+.histin{padding:14px}
+.hbars{display:flex;gap:6px;align-items:flex-end}
+.hcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:5px;min-width:0}
+.hv{font-size:10.5px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.hb{width:60%;max-width:22px;background:var(--navy);border-radius:2px 2px 0 0;min-height:2px}
+.htrend{margin-top:12px;font-size:13px;color:var(--ink-2)}
+.htrend.up{color:var(--neg)}
+.htrend.dn{color:var(--pos)}
+.htrend b{font-variant-numeric:tabular-nums}
+
+@media(max-width:900px){
+  .sub-h,.sub-r{grid-template-columns:1fr 84px 92px}
+  .sub-h span:nth-child(2),.sub-h span:nth-child(5),.sub-r .sc{display:none}
+  .acts2{grid-column:1/-1;justify-content:flex-start;margin-top:6px}
+}
