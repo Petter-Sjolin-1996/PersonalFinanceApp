@@ -1,4 +1,4 @@
-import * as C from './core.js?v=13';
+import * as C from './core.js?v=14';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -75,8 +75,11 @@ function recurring(months) {
     const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
     const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
     const rule = ann.merchantRules[e.merchant] || {};
+    const auto = mean && sd / mean <= cv ? 'subscription' : 'habit';
     out.push({ ...e, seen, mean, cv: mean ? sd / mean : 1,
-               kind: mean && sd / mean <= cv ? 'subscription' : 'habit',
+               kind: (ann.recurring[e.merchant] || {}).kind || auto, auto,
+               cancelled: (ann.recurring[e.merchant] || {}).cancelled || null,
+               last: e.per[months.at(-1)] || 0,
                tier: rule.group ? tierOf(rule.group, rule.label) : 'Discretionary',
                cat: rule.group ? rule.group + ' / ' + rule.label : '—',
                perYear: e.total / months.length * 12 });
@@ -251,7 +254,7 @@ async function connect() {
   if (!CONF.accounts?.length) CONF.accounts = ledger.accounts || [];
   ann = A ? A.json : { version: 1 };
   shaA = A ? A.sha : null;
-  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs','transferRules','txOverrides']) ann[k] ||= {};
+  for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs','transferRules','txOverrides','recurring']) ann[k] ||= {};
   dirty = false; confDirty = false; setSync('on', 'synced');
 }
 
@@ -922,41 +925,115 @@ function drawSubs() {
   const months = complete().slice(-12);
   const host = $('viewSubs');
   if (!months.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3></div>'; return; }
-  // Must-have recurring items — rent, energy, a-kassa — are not decisions,
-  // so they would only crowd out the things you can actually act on.
+  const last = months.at(-1);
+  // Must-have recurring costs are not decisions, so they would only crowd out
+  // the things you can actually act on.
   const all = recurring(months).filter(r => r.tier !== 'Must have');
-  const subs = all.filter(r => r.kind === 'subscription');
-  const habits = all.filter(r => r.kind === 'habit');
-  const yr = list => list.reduce((a, r) => a + r.perYear, 0);
-  const table = (list, empty) => list.length ? `<div class="tgt">
-      <div class="sub-h"><span>Merchant</span><span>Category</span><span>Per month</span><span>Per year</span></div>
-      ${list.map(r => `<div class="sub-r"><b>${r.merchant}</b>
-        <span class="sc">${r.cat}<span class="tag tt${TIERS.indexOf(r.tier)}">${r.tier}</span></span>
-        <span class="v">${krN(r.mean)}</span><span class="v strong">${krN(r.perYear)}</span></div>`).join('')}
-    </div>` : `<p class="lede">${empty}</p>`;
+  const live = all.filter(r => !r.cancelled);
+  const subs = live.filter(r => r.kind === 'subscription').sort((a, b) => b.last - a.last);
+  const habits = live.filter(r => r.kind === 'habit').sort((a, b) => b.last - a.last);
+  const gone = all.filter(r => r.cancelled).sort((a, b) => b.mean - a.mean);
+  const runRate = list => list.reduce((a, r) => a + r.last * 12, 0);
+  const saved = gone.reduce((a, r) => a + r.mean * 12, 0);
 
   host.innerHTML = `
-    <p class="lede">Detected automatically from your ledger: anything appearing in most of the last
-      ${months.length} months. Must-have costs such as rent, energy and a-kassa are left out —
-      they recur, but they are not choices. Nothing to label here.</p>
+    <p class="lede">Detected automatically: anything appearing in most of the last ${months.length} months.
+      Must-have costs such as rent, energy and a-kassa are left out. Figures are ${monthName(last)}
+      annualised — what you are on track to spend if nothing changes.</p>
+
     <div class="kpi">
-      <div class="stat big"><b>Subscriptions</b><span>${krN(yr(subs))} kr</span>
-        <small>per year across ${subs.length} merchants · ${krN(yr(subs) / 12)} kr a month</small></div>
-      <div class="stat"><b>Recurring habits</b><span>${krN(yr(habits))} kr</span>
-        <small>per year across ${habits.length} merchants</small></div>
+      <div class="stat big"><b>Subscriptions, annual run rate</b><span>${krN(runRate(subs))} kr</span>
+        <small>${subs.length} active · ${krN(runRate(subs) / 12)} kr in ${monthName(last)}</small></div>
+      <div class="stat"><b>Habits, annual run rate</b><span>${krN(runRate(habits))} kr</span>
+        <small>${habits.length} merchants</small></div>
+      <div class="stat"><b>Cancelled — saving</b><span class="good">${krN(saved)} kr</span>
+        <small>${gone.length ? `${gone.length} cancelled · ${krN(saved / 12)} kr a month` : 'nothing cancelled yet'}</small></div>
     </div>
 
     <h3 class="sh">Subscriptions — same amount every month</h3>
-    <p class="lede">These renew whether you use them or not. One decision each, and it saves every month after.</p>
-    ${table(subs, 'None detected.')}
+    <p class="lede">These renew whether you use them or not. Tick one off when you cancel it.</p>
+    ${subTable(subs, last, 'subscription')}
 
     <h3 class="sh">Habits — recurring, but the amount varies</h3>
-    <p class="lede">Not cancellable, but visible. These are choices you make repeatedly rather than once.</p>
-    ${table(habits, 'None detected.')}
+    <p class="lede">Not cancellable, but trackable. Tap a row to see how it has moved month by month.</p>
+    ${subTable(habits, last, 'habit')}
+
+    ${gone.length ? `<h3 class="sh">Cancelled</h3>
+      <p class="lede">Kept here so the saving stays visible. Untick to bring one back.</p>
+      ${subTable(gone, last, 'gone')}` : ''}
+
     <p class="note">A merchant counts as recurring when it appears in at least
       ${Math.ceil(months.length * ((CONF.meta.recurring || {}).minMonthsShare ?? 0.6))} of ${months.length} months.
-      It is a subscription when the monthly amount barely moves, a habit when it swings.
-      Move something in or out of this list by changing its category under Categorise, or its tier under Categories.</p>`;
+      Subscriptions are those whose monthly amount barely moves; the split is automatic but you can move any row.
+      A cancelled item is valued at its historical average, since ${monthName(last)} may already be zero.</p>`;
+
+  wireSubs(host, months);
+}
+
+function subTable(list, last, mode) {
+  if (!list.length) return '<p class="lede">None.</p>';
+  return `<div class="tgt"><div class="sub-h">
+      <span>Merchant</span><span>Category</span><span>${monthName(last)}</span><span>Per year</span><span></span></div>
+    ${list.map((r, i) => `<div class="sub-r ${mode === 'gone' ? 'off' : ''} ${mode === 'habit' ? 'tap' : ''}" data-m="${encodeURIComponent(r.merchant)}" data-i="${i}">
+        <b>${r.merchant}${mode === 'habit' ? '<span class="chev">›</span>' : ''}</b>
+        <span class="sc">${r.cat}<span class="tag tt${TIERS.indexOf(r.tier)}">${r.tier}</span></span>
+        <span class="v">${krN(mode === 'gone' ? r.mean : r.last)}</span>
+        <span class="v strong">${krN((mode === 'gone' ? r.mean : r.last) * 12)}</span>
+        <span class="acts2">
+          <label class="mini"><input type="checkbox" class="cx" ${r.cancelled ? 'checked' : ''}> Cancelled</label>
+          ${mode !== 'gone' ? `<button class="lnk mv2">${r.kind === 'subscription' ? 'to habits' : 'to subscriptions'}</button>` : ''}
+        </span>
+      </div>
+      ${mode === 'habit' ? `<div class="hist" data-h="${i}" hidden></div>` : ''}`).join('')}
+  </div>`;
+}
+
+function wireSubs(host, months) {
+  const byName = Object.fromEntries(recurring(months).map(r => [r.merchant, r]));
+  host.querySelectorAll('.sub-r').forEach(row => {
+    const name = decodeURIComponent(row.dataset.m);
+    row.querySelector('.cx').onchange = e => {
+      const rec = ann.recurring[name] ||= {};
+      if (e.target.checked) rec.cancelled = new Date().toISOString().slice(0, 10);
+      else delete rec.cancelled;
+      markDirty(); drawSubs();
+    };
+    row.querySelector('.mv2')?.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const rec = ann.recurring[name] ||= {};
+      rec.kind = byName[name]?.kind === 'subscription' ? 'habit' : 'subscription';
+      markDirty(); drawSubs();
+    });
+    if (!row.classList.contains('tap')) return;
+    row.onclick = ev => {
+      if (ev.target.closest('.acts2')) return;
+      const box = host.querySelector(`[data-h="${row.dataset.i}"]`);
+      if (!box) return;
+      if (!box.dataset.built) { box.innerHTML = historyFor(byName[name], months); box.dataset.built = '1'; }
+      box.hidden = !box.hidden; row.classList.toggle('open', !box.hidden);
+    };
+  });
+}
+
+/** Month-by-month for one habit, with the recent half compared to the earlier
+    half — the question is direction, not level. */
+function historyFor(r, months) {
+  if (!r) return '';
+  const vals = months.map(m => r.per[m] || 0);
+  const mx = Math.max(...vals, 1);
+  const half = Math.floor(months.length / 2);
+  const early = vals.slice(0, half).reduce((a, b) => a + b, 0) / (half || 1);
+  const late = vals.slice(half).reduce((a, b) => a + b, 0) / (months.length - half || 1);
+  const pct = early ? (late - early) / early * 100 : 0;
+  return `<div class="histin">
+    <div class="hbars">${months.map((m, i) => `<div class="hcol">
+      <span class="hv">${vals[i] ? krN(vals[i]) : '–'}</span>
+      <div class="hb" style="height:${vals[i] / mx * 72}px"></div>
+      <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`).join('')}</div>
+    <div class="htrend ${pct > 5 ? 'up' : pct < -5 ? 'dn' : ''}">
+      Recent ${months.length - half} months average <b>${krN(late)} kr</b> against
+      <b>${krN(early)} kr</b> earlier — ${pct > 0 ? '+' : ''}${Math.round(pct)}%</div>
+  </div>`;
 }
 
 /* ------------------------------------------------- transfers & income --- */
