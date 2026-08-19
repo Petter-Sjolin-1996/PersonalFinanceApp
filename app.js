@@ -1,4 +1,4 @@
-import * as C from './core.js?v=18';
+import * as C from './core.js?v=19';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -18,7 +18,7 @@ const FALLBACK_CATS = [
 const CFG_KEY = 'ledger.cfg';
 const SEEN_KEY = 'ledger.lastSaved';   // stamp of the newest annotations this device wrote
 const SECTIONS = {
-  control:      [['overview','Overview'], ['subs','Subscriptions'], ['targets','Targets']],
+  control:      [['overview','Overview'], ['month','Month deep-dive'], ['subs','Subscriptions']],
   transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
   categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'],
                  ['swish','Swish counterparties'], ['other','Transfers & income']],
@@ -29,7 +29,7 @@ let CONF = null, shaC = null, confDirty = false;
 let ledger = null, ann = null, shaL = null, shaA = null;
 let dirty = false, section = 'control', pane = 'overview';
 let filter = 'todo', sort = 'value', query = '', adjust = false;
-let pendingImport = null, staleWarning = null;
+let pendingImport = null, staleWarning = null, monthCursor = null;
 
 const $ = id => document.getElementById(id);
 const el = h => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
@@ -344,7 +344,7 @@ function go(sec, p) {
   $('subnav').hidden = panes.length < 2;
 
   const show = {
-    overview: 'viewControl', subs: 'viewSubs', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
+    overview: 'viewControl', month: 'viewMonth', subs: 'viewSubs', import: 'viewImport', coverage: 'viewCoverage',
     expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish', other: 'viewOther',
   };
   for (const v of Object.values(show)) $(v).hidden = true;
@@ -355,7 +355,7 @@ function go(sec, p) {
   const n = unconfirmed() + corpUnreviewed() + swishUnnamed() + otherUnruled();
   $('navBadge').textContent = n; $('navBadge').hidden = !n;
 
-  ({ overview: drawControl, subs: drawSubs, targets: drawTargets, import: drawImport, coverage: drawCoverage,
+  ({ overview: drawControl, month: drawMonth, subs: drawSubs, import: drawImport, coverage: drawCoverage,
      expenses: render, corp: renderCorp, swish: renderSwish, other: renderOther })[pane]();
 }
 document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dataset.s));
@@ -465,33 +465,13 @@ function drawControl() {
         coloured by tier. Discretionary averages <b>${krN(per.reduce((a, p) => a + p.seg['Discretionary'], 0) / per.length)} kr</b> a month.</p>`;
     })()}
 
-    <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
-    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
-      ${Object.keys(T.monthly).sort().map(g => {
-        const a = byGroup[g]?.[last] || 0, t = T.monthly[g], pct = t ? Math.min(a / t * 100, 100) : 0;
-        return `<div class="tgt-r"><b>${g}</b>
-          <span class="v ${a > t ? 'over' : 'under'}">${kr(a)}</span><span class="v">${kr(t)}</span>
-          <div class="bar"><i class="${a > t ? 'over' : ''}" style="width:${pct}%"></i></div></div>`;
-      }).join('')}</div>
-
-    <h3 class="sh">Annual budgets — used so far this year</h3>
-    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Used</span><span>Budget</span><span>Pace</span></div>
-      ${Object.keys(T.annual).sort().map(g => {
-        const used = Object.values(byGroup[g] || {}).reduce((a, b) => a + b, 0);
-        const b = T.annual[g], pct = b ? Math.min(used / b * 100, 100) : 0;
-        const pace = all.length / 12 * 100;
-        return `<div class="tgt-r"><b>${g}</b>
-          <span class="v ${used > b * all.length / 12 ? 'over' : 'under'}">${kr(used)}</span>
-          <span class="v">${kr(b)}</span>
-          <div class="bar"><i class="${used > b ? 'over' : ''}" style="width:${pct}%"></i><u style="left:${pace}%"></u></div></div>`;
-      }).join('')}</div>
-    <p class="note">The vertical marker shows where you would be if spending were even across the year
-      — ${all.length} of 12 months elapsed.</p>`;
+`;
 
   $('adj').onchange = e => { adjust = e.target.checked; drawControl(); };
   host.querySelectorAll('.fbw.tapme').forEach(b => {
-    b.onclick = () => openMonth(b.dataset.m, months);
-    b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openMonth(b.dataset.m, months); } };
+    const goMonth = () => { monthCursor = complete().indexOf(b.dataset.m); go('control', 'month'); };
+    b.onclick = goMonth;
+    b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goMonth(); } };
   });
 }
 
@@ -510,114 +490,156 @@ function breakdown(months) {
   return cats;
 }
 
-function openMonth(m, months) {
-  $('monthModal')?.remove();
-  const cats = breakdown(months);
-  const rows = Object.entries(cats).map(([cat, c]) => {
-    const now = c.byMonth[m] || 0;
-    const avg = months.reduce((a, x) => a + (c.byMonth[x] || 0), 0) / months.length;
-    const subs = Object.entries(c.subs)
-      .map(([label, by]) => ({ label, now: by[m] || 0,
-                               avg: months.reduce((a, x) => a + (by[x] || 0), 0) / months.length }))
-      .filter(s => s.now || s.avg)
-      .sort((a, b) => b.now - a.now);
-    return { cat, now, avg, delta: now - avg, subs };
-  }).filter(r => r.now || r.avg).sort((a, b) => b.now - a.now);
 
-  const total = rows.reduce((a, r) => a + r.now, 0);
-  const totAvg = rows.reduce((a, r) => a + r.avg, 0);
-  const gap = total - totAvg;
-  const movers = rows.slice().sort((a, b) => b.delta - a.delta);
-  const up = movers.filter(r => r.delta > 0).slice(0, 3);
-  const down = movers.filter(r => r.delta < 0).slice(-2).reverse();
-  const scale = Math.max(...rows.flatMap(r => [r.now, r.avg]), 1);
 
-  // one shared scale, zero-anchored so a negative net Swish reads correctly
-  const maxPos = Math.max(...rows.flatMap(r => [r.now, r.avg, 0]));
-  const maxNeg = Math.abs(Math.min(...rows.flatMap(r => [r.now, r.avg, 0])));
-  const span = maxPos + maxNeg || 1;
-  const zero = maxNeg / span * 100;
-  const seg = v => v >= 0
-    ? { left: zero, width: v / span * 100 }
-    : { left: zero - Math.abs(v) / span * 100, width: Math.abs(v) / span * 100 };
-  const tick = v => zero + v / span * 100;
 
-  const headScale = Math.max(total, totAvg, 1);
-  const bar = (v, cls) => `<div class="hbar"><i class="${cls}" style="width:${v / headScale * 100}%"></i></div>`;
+/* ==================================================== MONTH DEEP-DIVE ==== */
+function drawMonth() {
+  const all = complete();
+  const host = $('viewMonth');
+  if (!all.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3></div>'; return; }
+  if (monthCursor == null || monthCursor < 0 || monthCursor >= all.length) monthCursor = all.length - 1;
+  const m = all[monthCursor];
+  const window12 = all.slice(-12);
+  const items = expenditureItems(window12);
+  const here = items.filter(i => i.m === m);
 
-  const modal = el(`<div class="modal" id="monthModal"><div class="sheet wide drill">
-    <div class="dhead">
-      <div><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2></div>
-      <button class="xclose" aria-label="Close">&times;</button>
+  const cats = {};
+  for (const it of here) {
+    const c = cats[it.group] ||= { group: it.group, total: 0, labels: {}, tier: it.tier };
+    c.total += it.v;
+    const l = c.labels[it.label] ||= { label: it.label, v: 0, tier: it.tier, fps: [] };
+    l.v += it.v; l.fps.push(it.fp);
+  }
+  const cols = Object.values(cats).sort((a, b) => b.total - a.total);
+  const mx = Math.max(...cols.map(c => c.total), 1);
+  const total = cols.reduce((a, c) => a + c.total, 0);
+
+  const avgOf = (fn) => window12.reduce((a, mm) =>
+    a + items.filter(i => i.m === mm && fn(i)).reduce((x, i) => x + i.v, 0), 0) / window12.length;
+  const totalAvg = avgOf(() => true);
+
+  host.innerHTML = `
+    <div class="mnav">
+      <button class="narw" id="mPrev" ${monthCursor === 0 ? 'disabled' : ''} aria-label="Previous month">‹</button>
+      <div class="mnow"><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2>
+        <span>${krN(total)} kr · ${total > totalAvg ? '+' : '−'}${krN(Math.abs(total - totalAvg))} kr against the
+        ${window12.length}-month average</span></div>
+      <button class="narw" id="mNext" ${monthCursor === all.length - 1 ? 'disabled' : ''} aria-label="Next month">›</button>
     </div>
 
-    <div class="hcompare">
-      <div class="hrow"><span class="hlab">This month</span>${bar(total, 'in')}<span class="hval">${krN(total)} kr</span></div>
-      <div class="hrow"><span class="hlab">${months.length}-month average</span>${bar(totAvg, 'out')}<span class="hval muted">${krN(totAvg)} kr</span></div>
-      <div class="hdelta ${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr ${gap > 0 ? 'above' : 'below'} average</div>
-    </div>
+    <div class="insight">${insightFor(m, items, window12)}</div>
 
-    <div class="dlist">
-      <div class="dl-h"><span>Category</span><span class="hcol">This month against average</span>
-        <span>This month</span><span>Average</span><span>Difference</span></div>
-      ${rows.map((r, i) => {
-        const b = seg(r.now);
-        return `<div class="dl-r" data-i="${i}" role="button" tabindex="0">
-          <b>${r.cat}<span class="chev">›</span></b>
-          <div class="cbar"><u class="zero" style="left:${zero}%"></u>
-            <i class="${r.now < 0 ? 'neg' : ''}" style="left:${b.left}%;width:${b.width}%"></i>
-            <u class="avg" style="left:${tick(r.avg)}%"></u></div>
-          <span class="v">${krN(r.now)}</span>
-          <span class="v muted">${krN(r.avg)}</span>
-          <span class="v ${r.delta > 0 ? 'over' : 'under'}">${r.delta > 0 ? '+' : '−'}${krN(Math.abs(r.delta))}</span>
+    <div class="mchart">${cols.map(c => {
+      const labs = Object.values(c.labels).sort((a, b) => b.v - a.v);
+      const h = c.total / mx * 300;
+      return `<div class="mcol">
+        <span class="mtot">${krN(c.total)}</span>
+        <div class="mstack" style="height:${h}px">
+          ${labs.map(l => `<button class="mseg t${TIERS.indexOf(l.tier)}"
+             style="height:${Math.max(l.v / c.total * h, 11)}px"
+             data-g="${encodeURIComponent(c.group)}" data-l="${encodeURIComponent(l.label)}"
+             title="${l.label} — ${krN(l.v)} kr">${l.v / c.total * h > 22 ? l.label : ''}</button>`).join('')}
         </div>
-        <div class="dl-sub" data-sub="${i}" hidden>${r.subs.map(s => `<div class="dl-s">
-          <span>${s.label}</span>
-          <div class="cbar sub"><u class="zero" style="left:${zero}%"></u>
-            <i class="${s.now < 0 ? 'neg' : ''}" style="left:${seg(s.now).left}%;width:${seg(s.now).width}%"></i>
-            <u class="avg" style="left:${tick(s.avg)}%"></u></div>
-          <span class="v">${krN(s.now)}</span><span class="v muted">${krN(s.avg)}</span>
-          <span class="v ${s.now - s.avg > 0 ? 'over' : 'under'}">${s.now - s.avg > 0 ? '+' : '−'}${krN(Math.abs(s.now - s.avg))}</span>
-        </div>`).join('') || '<div class="dl-s"><span>No detail</span></div>'}</div>`;
-      }).join('')}
-    </div>
-    <p class="note">The grey tick on each bar marks the ${months.length}-month average, which includes this month.
-      Tap any category for its labels.</p>
-  </div></div>`);
+        <span class="mcat">${c.group}</span></div>`;
+    }).join('')}</div>
+    <p class="note">One column per category, tallest first, split by label. Tap any block for its transactions.
+      Very small blocks are drawn at a minimum height so they stay tappable, so those are not to scale.</p>`;
 
-  document.body.appendChild(modal);
-  const close = () => modal.remove();
-  modal.querySelector('.xclose').onclick = close;
-  modal.onclick = e => { if (e.target === modal) close(); };
-  modal.querySelectorAll('.dl-r').forEach(r => {
-    const toggle = () => {
-      const sub = modal.querySelector(`[data-sub="${r.dataset.i}"]`);
-      sub.hidden = !sub.hidden; r.classList.toggle('open', !sub.hidden);
-    };
-    r.onclick = toggle;
-    r.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
-  });
+  $('mPrev').onclick = () => { monthCursor--; drawMonth(); };
+  $('mNext').onclick = () => { monthCursor++; drawMonth(); };
+  host.querySelectorAll('.mseg').forEach(b => b.onclick = () =>
+    openSeg(m, decodeURIComponent(b.dataset.g), decodeURIComponent(b.dataset.l)));
 }
 
-function drawTargets() {
-  const host = $('viewTargets');
-  const T = CONF.targets;
-  const all = [...new Set(CONF.categories.map(c => c.group))].sort();
-  host.innerHTML = `<p class="lede">Steady groups get a monthly target. Lumpy ones — where a single trip or
-    a semi-annual bill dominates — get an annual budget instead, because a monthly figure for them would be
-    breached or trivially met almost every month. Move a group between the two by clearing one field and filling the other.</p>
-    <div class="tgt"><div class="tgt-h"><span>Group</span><span>Monthly</span><span>Annual</span><span></span></div>
-    ${all.map(g => `<div class="tgt-r" data-g="${g}"><b>${g}</b>
-      <span class="tgtin"><input data-k="monthly" inputmode="numeric" value="${T.monthly[g] ?? ''}"></span>
-      <span class="tgtin"><input data-k="annual" inputmode="numeric" value="${T.annual[g] ?? ''}"></span>
-      <span class="v">${T.monthly[g] ? kr(T.monthly[g] * 12) + ' / yr' : T.annual[g] ? kr(T.annual[g] / 12) + ' / mo' : '—'}</span>
-    </div>`).join('')}</div>`;
-  host.querySelectorAll('.tgt-r').forEach(r => r.querySelectorAll('input').forEach(i => i.onchange = e => {
-    const g = r.dataset.g, k = i.dataset.k, v = parseFloat(e.target.value.replace(/\s/g, ''));
-    if (isFinite(v) && v > 0) { T[k][g] = Math.round(v); T[k === 'monthly' ? 'annual' : 'monthly'] && delete T[k === 'monthly' ? 'annual' : 'monthly'][g]; }
-    else delete T[k][g];
-    confDirty = true; markDirty(); drawTargets();
-  }));
+/** Rules-based synthesis: real deviations, and what holding them to average
+    would have saved. Arithmetic with sentences around it, not interpretation. */
+function insightFor(m, items, window12) {
+  const byCat = {}, byLab = {};
+  for (const it of items) {
+    (byCat[it.group] ||= {})[it.m] = (byCat[it.group][it.m] || 0) + it.v;
+    (byLab[it.label] ||= {})[it.m] = (byLab[it.label][it.m] || 0) + it.v;
+  }
+  const dev = o => Object.entries(o).map(([k, by]) => {
+    const now = by[m] || 0;
+    const avg = window12.reduce((a, mm) => a + (by[mm] || 0), 0) / window12.length;
+    return { k, now, avg, d: now - avg };
+  }).sort((a, b) => b.d - a.d);
+  const cats = dev(byCat), labs = dev(byLab);
+  const tot = items.filter(i => i.m === m).reduce((a, i) => a + i.v, 0);
+  const totAvg = window12.reduce((a, mm) => a + items.filter(i => i.m === mm).reduce((x, i) => x + i.v, 0), 0) / window12.length;
+  const disc = items.filter(i => i.m === m && i.tier === 'Discretionary').reduce((a, i) => a + i.v, 0);
+  const discAvg = window12.reduce((a, mm) =>
+    a + items.filter(i => i.m === mm && i.tier === 'Discretionary').reduce((x, i) => x + i.v, 0), 0) / window12.length;
+  const up = labs.filter(l => l.d > 500).slice(0, 2);
+  const down = labs.filter(l => l.d < -500).slice(-1);
+  const saving = up.reduce((a, l) => a + l.d, 0);
+  const s = [];
+  s.push(`Spending came to <b>${krN(tot)} kr</b>, ${tot > totAvg ? 'above' : 'below'} the ${window12.length}-month
+    average by ${krN(Math.abs(tot - totAvg))} kr, with discretionary at ${krN(disc)} kr against a usual ${krN(discAvg)} kr.`);
+  if (cats[0] && cats[0].d > 300)
+    s.push(`<b>${cats[0].k}</b> was the biggest mover at ${krN(cats[0].now)} kr against ${krN(cats[0].avg)} kr.`);
+  if (up.length)
+    s.push(`Within it the pressure came from ${up.map(l => `<b>${l.k}</b> at ${krN(l.now)} kr against a usual ${krN(l.avg)} kr`).join(' and ')}.`);
+  if (down.length)
+    s.push(`<b>${down[0].k}</b> pulled the other way, ${krN(Math.abs(down[0].d))} kr below average.`);
+  if (saving > 500)
+    s.push(`Holding ${up.length > 1 ? 'those' : 'that'} to ${up.length > 1 ? 'their usual levels' : 'its usual level'}
+      would have saved about <b>${krN(saving)} kr</b>.`);
+  return s.slice(0, 4).join(' ');
+}
+
+/** Transactions behind one block — and the three controls you would otherwise
+    have to go to Categorise to reach. */
+function openSeg(m, group, label) {
+  $('segModal')?.remove();
+  const skip = excludedRefs();
+  const rows = ledger.transactions.filter(t => {
+    if (t.date.slice(0, 7) !== m || skip.has(t.ref)) return false;
+    if (isSpendRow(t)) {
+      const r = ann.merchantRules[mkey(t)] || {};
+      return !ann.workExpenses[t.fp] && (r.group || 'Unknown') === group && (r.label || 'Unlabelled') === label;
+    }
+    if (isPersonSwish(t)) return group === 'Swish (net)' && (ann.swishNames[t.ref] || t.ref) === label;
+    if (isOther(t)) { const f = flowOf(t); return f.counts === 'expenditure' && f.group === group && f.label === label; }
+    return false;
+  }).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+  const sum = rows.reduce((a, t) => a + Math.abs(t.amount), 0);
+
+  const mod = el(`<div class="modal" id="segModal"><div class="sheet">
+    <div class="dhead"><div><h2>${label}</h2>
+      <p class="dsum">${group} · ${rows.length} transaction${rows.length > 1 ? 's' : ''} · <b>${krN(sum)} kr</b></p></div>
+      <button class="xclose" aria-label="Close">&times;</button></div>
+    <div class="seglist">${rows.map(t => `<div class="segr" data-fp="${t.fp}">
+      <span class="sd">${t.date.slice(5)}</span>
+      <span class="sm" title="${t.merchant}">${t.merchant}</span>
+      <span class="sv num">${kr(t.amount)}</span>
+      <span class="sf">
+        <label class="mini"><input type="checkbox" class="fo" ${ann.oneOffs[t.fp] ? 'checked' : ''}> one-off</label>
+        <label class="mini"><input type="checkbox" class="fw" ${ann.workExpenses[t.fp] ? 'checked' : ''}> work</label>
+      </span></div>`).join('')}</div>
+    ${rows.length && isSpendRow(rows[0]) ? `<label>Recategorise ${mkey(rows[0])}
+      <select id="segCat">${optionsFor(group + ' / ' + label)}</select></label>` : ''}
+    <div class="sheet-act"><button class="btn pri" id="segClose">Done</button></div>
+  </div></div>`);
+  document.body.appendChild(mod);
+  const shut = () => { mod.remove(); drawMonth(); };
+  mod.querySelector('.xclose').onclick = shut;
+  mod.querySelector('#segClose').onclick = shut;
+  mod.onclick = e => { if (e.target === mod) shut(); };
+  mod.querySelectorAll('.segr').forEach(r => {
+    const fp = r.dataset.fp;
+    r.querySelector('.fo').onchange = e => {
+      if (e.target.checked) ann.oneOffs[fp] = true; else delete ann.oneOffs[fp]; markDirty(); };
+    r.querySelector('.fw').onchange = e => {
+      if (e.target.checked) ann.workExpenses[fp] = true; else delete ann.workExpenses[fp]; markDirty(); };
+  });
+  mod.querySelector('#segCat')?.addEventListener('change', e => {
+    const [g, l] = (e.target.value || ' / ').split(' / ');
+    const r = ann.merchantRules[mkey(rows[0])] ||= {};
+    r.group = g || null; r.label = l || null; r.confirmed = true;
+    markDirty(); toast('Recategorised — applies to every transaction from this merchant');
+  });
 }
 
 /* ========================================================== COVERAGE ===== */
