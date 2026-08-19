@@ -84,17 +84,29 @@ const isSpendRow = t =>
   (t.role === 'p2p' && !(t.ref || '').startsWith('+46'));
 
 /** Money in and money out, per month.
-    Income is salary only — reimbursements repay work expenses you fronted,
-    they are not earnings. Expenditure is everything that leaves and does not
-    come back: personal spending, obligations you owe (the mortgage to Dad,
-    your mother's phone), and the net of Swish with people. Transfers to your
-    own accounts and to Avanza are excluded — that is saving, not spending. */
+
+    Income is salary only — reimbursements repay work expenses you fronted, so
+    counting them would double up against the corporate card, which is already
+    excluded on the spending side.
+
+    Expenditure is money that leaves and does not come back: personal spending,
+    the recurring obligations you owe, and the net of Swish with people.
+    Excluded by design — transfers between your own accounts, Avanza (that is
+    saving, not spending), Amex invoice payments (the charges themselves are
+    already counted), and any account listed in meta.excludeFromCashflow. */
+function excludedRefs() {
+  const ids = CONF.meta.excludeFromCashflow || [];
+  return new Set((CONF.accounts || []).filter(a => ids.includes(a.id)).map(a => a.match?.ref).filter(Boolean));
+}
+
 function cashByMonth(months) {
+  const skip = excludedRefs();
   const out = {};
   months.forEach(m => out[m] = { income: 0, spend: 0 });
   for (const t of ledger.transactions) {
     const m = t.date.slice(0, 7);
     if (!out[m]) continue;
+    if (skip.has(t.ref)) continue;
     if (adjust && ann.oneOffs[t.fp]) continue;
     if (t.role === 'income') out[m].income += t.amount;
     else if (isSpendRow(t)) { if (!ann.workExpenses[t.fp]) out[m].spend += Math.abs(t.amount); }
@@ -106,6 +118,7 @@ function cashByMonth(months) {
 }
 const r100 = n => Math.round(n / 100) * 100;
 const krR = n => r100(n).toLocaleString('sv-SE') + ' kr';
+const krN = n => r100(n).toLocaleString('sv-SE');
 const delta = (latest, avg) => {
   const d = r100(latest - avg);
   if (!d) return 'in line with the average';
@@ -223,7 +236,6 @@ function drawControl() {
     + Object.values(T.annual).reduce((a, b) => a + b, 0) / 12;
   const oneOffCount = Object.keys(ann.oneOffs).length;
   const scale = Math.max(...months.flatMap(m => [cash[m].income, cash[m].spend]), 1);
-  const netAbsMax = Math.max(...months.map(m => Math.abs(cash[m].net)), 1);
 
   host.innerHTML = `
     <div class="kpi">
@@ -242,21 +254,23 @@ function drawControl() {
     <div style="margin-top:12px"><label class="toggle"><input type="checkbox" id="adj" ${adjust ? 'checked' : ''}> Exclude one-offs</label></div>
 
     <h3 class="sh">Income, expenditure and net by month</h3>
+    <div class="legend"><span><i class="sw-in"></i>Income</span><span><i class="sw-out"></i>Expenditure</span>
+      <span><i class="sw-pill"></i>Net savings</span></div>
     <div class="flow">${months.map(m => {
       const c = cash[m], neg = c.net < 0;
-      const size = 34 + Math.abs(c.net) / netAbsMax * 20;
       return `<div class="fcol">
-        <div class="bubble ${neg ? 'neg' : ''}" style="width:${size}px;height:${size}px"
-             title="net ${krR(c.net)}">${r100(c.net / 1000 * 10) / 10}k</div>
-        <div class="fbars">
-          <div class="fb in" style="height:${c.income / scale * 100}%" title="income ${krR(c.income)}"></div>
-          <div class="fb out" style="height:${c.spend / scale * 100}%" title="expenditure ${krR(c.spend)}"></div>
+        <div class="pill ${neg ? 'neg' : ''}">${krN(c.net)}</div>
+        <div class="fpair">
+          <div class="fbw"><span class="fnum">${krN(c.income)}</span>
+            <div class="fb in" style="height:${c.income / scale * 100}%"></div></div>
+          <div class="fbw"><span class="fnum">${krN(c.spend)}</span>
+            <div class="fb out" style="height:${c.spend / scale * 100}%"></div></div>
         </div>
         <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`;
     }).join('')}</div>
-    <p class="note"><i class="sw-in"></i> income &nbsp; <i class="sw-out"></i> expenditure &nbsp;
-      the circle is net savings, sized by magnitude. Everything rounded to the nearest 100 kr.
-      Income counts salary only; expenditure counts personal spending, obligations and net Swish with people.</p>
+    <p class="note">Everything rounded to the nearest 100 kr. Income counts salary only.
+      Expenditure counts personal spending, recurring obligations and net Swish with people —
+      it excludes transfers between your own accounts, Avanza, Amex invoice payments and lump repayments to your dad.</p>
 
     <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
     <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
