@@ -488,3 +488,13 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
   .sub-h span:nth-child(2),.sub-h span:nth-child(5),.sub-r .sc{display:none}
   .acts2{grid-column:1/-1;justify-content:flex-start;margin-top:6px}
 }
+
+/* ---- momentum arrow ---- */
+.arw{font-style:normal;font-size:11px;margin-left:4px;vertical-align:1px}
+.arw.up{color:var(--neg)}
+.arw.dn{color:var(--pos)}
+.arw.fl{color:var(--muted)}
+.mom{font-style:normal;margin-left:6px;font-size:11px}
+.mom.up{color:var(--neg)}
+.mom.dn{color:var(--pos)}
+.mom.flat{color:var(--muted)}
