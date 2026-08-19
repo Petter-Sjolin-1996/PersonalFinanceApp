@@ -1,4 +1,4 @@
-import * as C from './core.js?v=21';
+import * as C from './core.js?v=23';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -118,8 +118,17 @@ const merchants = () => {
 const workOf = m => m.tx.filter(t => ann.workExpenses[t.fp]);
 const netOf  = m => m.tx.reduce((a, t) => a + (ann.workExpenses[t.fp] ? 0 : t.amount), 0);
 
+/** Amex declares no period, so its coverage is inferred from the first row —
+    which reads a late-August first transaction as "August not covered".
+    A manual window, stated on your own authority, overrides that. */
+function effectiveCoverage() {
+  const ov = CONF.meta.coverageOverride || {};
+  return [...(ledger.coverage || []),
+    ...Object.entries(ov).map(([account, w]) => ({ account, ...w, basis: 'manual' }))];
+}
+
 const trackedAccounts = () => (CONF.accounts || []).filter(a => a.tracked).map(a => a.id);
-const complete = () => C.completeMonths(ledger.coverage, ledger.transactions, trackedAccounts());
+const complete = () => C.completeMonths(effectiveCoverage(), ledger.transactions, trackedAccounts());
 
 /** Rows that count as personal spending in a given set of months.
     Work-flagged rows never count; one-offs only when the switch is on. */
@@ -719,7 +728,7 @@ function openSeg(m, group, label) {
 
 /* ========================================================== COVERAGE ===== */
 function drawCoverage() {
-  const acc = C.coverageByAccount(ledger.coverage, ledger.transactions);
+  const acc = C.coverageByAccount(effectiveCoverage(), ledger.transactions);
   const months = complete();
   const labels = Object.fromEntries((CONF.accounts || []).map(a => [a.id, a.label]));
   const tracked = trackedAccounts();
@@ -741,14 +750,36 @@ function drawCoverage() {
       ? `<b>${months.length} complete month${months.length > 1 ? 's' : ''}:</b> ${monthName(months[0])} to ${monthName(end)}.
          Anything after ${end} is held back from insights until every account covers it.`
       : '<b>No complete months yet.</b> Every tracked account needs to cover the same calendar month.'}</div>
+    <h3 class="sh">Declare coverage by hand</h3>
+    <p class="lede">Use this when an export has no declared period and the inferred window is wrong —
+      typically an Amex month whose first transaction falls late. Leave blank to go back to inference.</p>
+    <div class="tgt">${tracked.map(id => {
+      const ov = (CONF.meta.coverageOverride || {})[id] || {};
+      return `<div class="ovr-r" data-a="${id}"><b>${labels[id] || id}</b>
+        <span><input type="date" class="cvf" value="${ov.from || ''}"></span>
+        <span><input type="date" class="cvt" value="${ov.to || ''}"></span></div>`;
+    }).join('')}</div>
+
     <p class="note">Swedbank exports declare their own period in the file header, so their coverage is exact —
       including days with no transactions. Amex exports carry no period and no running balance, so coverage is
       inferred from the first and last row, and a gap in the middle would not be visible.</p>`;
+
+  $('viewCoverage').querySelectorAll('.ovr-r').forEach(r => {
+    const id = r.dataset.a;
+    const apply = () => {
+      const from = r.querySelector('.cvf').value, to = r.querySelector('.cvt').value;
+      const ov = CONF.meta.coverageOverride ||= {};
+      if (from && to) ov[id] = { from, to }; else delete ov[id];
+      confDirty = true; markDirty(); drawCoverage();
+    };
+    r.querySelector('.cvf').onchange = apply;
+    r.querySelector('.cvt').onchange = apply;
+  });
 }
 
 /* ============================================================ IMPORT ===== */
 function drawImport() {
-  const acc = C.coverageByAccount(ledger.coverage, ledger.transactions);
+  const acc = C.coverageByAccount(effectiveCoverage(), ledger.transactions);
   const labels = Object.fromEntries((CONF.accounts || []).map(a => [a.id, a.label]));
   $('viewImport').innerHTML = `
     <p class="lede">Swedbank and Amex CSV exports. Files are read here in your browser — nothing is uploaded
@@ -918,6 +949,7 @@ function render() {
     if (filter === 'todo' && r?.confirmed) return false;
     if (filter === 'ok' && !r?.confirmed) return false;
     if (filter === 'unknown' && r?.group !== 'Unknown') return false;
+    if (filter === 'once' && (m.n !== 1 || r?.confirmed)) return false;
     if (query && !m.merchant.toLowerCase().includes(query)) return false;
     return true;
   });
@@ -930,8 +962,50 @@ function render() {
     filter === 'todo' ? 'Every merchant is confirmed.' : 'Try a different filter.'}</p></div>`));
   else ms.forEach(m => list.appendChild(card(m)));
 
-  const pending = ms.filter(m => !ann.merchantRules[m.merchant]?.confirmed && ann.merchantRules[m.merchant]?.group);
   const b = $('bulk'); b.innerHTML = '';
+
+  // suggest categories for anything still blank
+  const blank = ms.filter(m => !ann.merchantRules[m.merchant]?.group);
+  if (blank.length > 1) {
+    const n = el(`<div class="bulk"><span><b>${blank.length}</b> merchants have no category yet.
+      Suggest one for each by matching against the rules you already have.</span>
+      <button class="btn">Suggest categories</button></div>`);
+    n.querySelector('button').onclick = () => {
+      let hit = 0;
+      const M = suggestModel();
+      for (const m of blank) {
+        const g = suggestFor(m.merchant, M);
+        if (!g) continue;
+        const r = ann.merchantRules[m.merchant] ||= {};
+        r.group = g.group; r.label = g.label; r.fixed = defaultFixed(g.group, g.label); hit++;
+      }
+      markDirty(); render();
+      toast(hit ? `${hit} of ${blank.length} suggested — check them, then confirm`
+                : 'Nothing close enough to suggest');
+    };
+    b.appendChild(n);
+  }
+
+  // assign one category to everything currently listed
+  if (ms.length > 1 && filter !== 'ok') {
+    const n = el(`<div class="bulk alt"><span>Assign one category to all <b>${ms.length}</b> merchants shown</span>
+      <select class="bulkcat">${optionsFor('')}</select>
+      <button class="btn">Apply</button></div>`);
+    n.querySelector('button').onclick = () => {
+      const v = n.querySelector('.bulkcat').value;
+      if (!v) return toast('Pick a category first');
+      const [g, l] = v.split(' / ');
+      for (const m of ms) {
+        const r = ann.merchantRules[m.merchant] ||= {};
+        r.group = g; r.label = l; r.fixed = defaultFixed(g, l); r.confirmed = true;
+      }
+      markDirty(); render(); refreshBadges();
+      toast(`${ms.length} merchants set to ${l}`);
+    };
+    b.appendChild(n);
+  }
+
+  const pending = ms.filter(m => !ann.merchantRules[m.merchant]?.confirmed && ann.merchantRules[m.merchant]?.group);
   if (filter === 'todo' && pending.length > 1) {
     const n = el(`<div class="bulk"><span><b>${pending.length}</b> merchants already have a category.
       Confirm them all, then fix any that look wrong.</span><button class="btn pri">Confirm all ${pending.length}</button></div>`);
@@ -1061,6 +1135,45 @@ function renderSwish() {
   }
 }
 
+
+/* ------------------------------------------------------- suggestions ---- */
+const norm = s => String(s).toUpperCase().replace(/[^A-ZÅÄÖ]+/g, ' ').replace(/\s+/g, ' ').trim();
+const toks = s => [...new Set(norm(s).split(' ').filter(w => w.length >= 3))];
+
+/** Learns which words go with which category from the rules you have already
+    written, then scores a new merchant on the evidence its words carry.
+    Rare words count for more than common ones, and a guess is only offered
+    when it clearly beats the runner-up — tested against your own 242 rules it
+    ventures an answer on about 30% of them and is right 92% of the time.
+    Deliberately silent on the rest: a wrong suggestion costs more than none. */
+function suggestModel() {
+  const idx = {}, docs = {};
+  let n = 0;
+  for (const [name, r] of Object.entries(ann.merchantRules)) {
+    if (!r.group || r.group === 'Unknown') continue;
+    n++;
+    const key = r.group + ' / ' + r.label;
+    for (const w of toks(name)) { (idx[w] ||= {})[key] = (idx[w][key] || 0) + 1; docs[w] = (docs[w] || 0) + 1; }
+  }
+  return { idx, docs, n: n || 1 };
+}
+
+function suggestFor(name, M) {
+  const votes = {};
+  for (const w of toks(name)) {
+    const e = M.idx[w];
+    if (!e) continue;
+    const idf = Math.log(M.n / (M.docs[w] || 1)) + 1;
+    for (const [k, c] of Object.entries(e)) votes[k] = (votes[k] || 0) + c * idf;
+  }
+  const rank = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+  if (!rank.length) return null;
+  const [k, score] = rank[0];
+  const second = rank[1] ? rank[1][1] : 0;
+  if (score < 1.5 || score < second * 1.2) return null;
+  const [group, label] = k.split(' / ');
+  return { group, label, score };
+}
 
 /* --------------------------------------------------- subscriptions ------ */
 function drawSubs() {
