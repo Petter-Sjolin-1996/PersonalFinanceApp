@@ -1,4 +1,4 @@
-import * as C from './core.js?v=17';
+import * as C from './core.js?v=18';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -131,6 +131,37 @@ function spendIn(months) {
     !(adjust && ann.oneOffs[t.fp]));
 }
 const groupOf = t => ann.merchantRules[mkey(t)]?.group || 'Unknown';
+
+/** Every krona of personal expenditure, resolved to group / label / tier.
+    THE single source for the overview sections, the targets and the month
+    drill-down — merchant purchases, obligations counted as expenditure
+    (the mortgage, the phone bill) and the net of Swish with people. */
+function expenditureItems(months) {
+  const skip = excludedRefs();
+  const set = new Set(months);
+  const out = [];
+  for (const t of ledger.transactions) {
+    const m = t.date.slice(0, 7);
+    if (!set.has(m) || skip.has(t.ref)) continue;
+    if (adjust && ann.oneOffs[t.fp]) continue;
+    if (isSpendRow(t)) {
+      if (ann.workExpenses[t.fp]) continue;
+      const r = ann.merchantRules[mkey(t)] || {};
+      out.push({ m, fp: t.fp, group: r.group || 'Unknown', label: r.label || 'Unlabelled',
+                 tier: r.group ? tierOf(r.group, r.label) : 'Discretionary', v: Math.abs(t.amount) });
+    } else if (isPersonSwish(t)) {
+      out.push({ m, fp: t.fp, group: 'Swish (net)', label: ann.swishNames[t.ref] || t.ref,
+                 tier: 'Discretionary', v: -t.amount });
+    } else if (isOther(t)) {
+      const f = flowOf(t);
+      if (f.counts !== 'expenditure') continue;
+      const g = f.group || 'Uncategorised transfers', l = f.label || (t.ref || t.desc);
+      out.push({ m, fp: t.fp, group: g, label: l,
+                 tier: f.group ? tierOf(g, l) : 'Discretionary', v: -t.amount });
+    }
+  }
+  return out;
+}
 const isSpendRow = t =>
   ((t.role === 'spend' || t.role === 'fee') && t.account !== 'amex_corp') ||
   (t.role === 'p2p' && !(t.ref || '').startsWith('+46'));
@@ -340,12 +371,9 @@ function drawControl() {
   const mean = k => months.reduce((a, m) => a + cash[m][k], 0) / months.length;
   const avgIn = mean('income'), avgOut = mean('spend'), avgNet = avgIn - avgOut;
 
-  const rows = spendIn(months);
+  const items = expenditureItems(months);
   const byGroup = {};
-  for (const t of rows) {
-    const m = t.date.slice(0, 7);
-    (byGroup[groupOf(t)] ||= {})[m] = (byGroup[groupOf(t)][m] || 0) + Math.abs(t.amount);
-  }
+  for (const it of items) (byGroup[it.group] ||= {})[it.m] = (byGroup[it.group][it.m] || 0) + it.v;
   const T = CONF.targets;
   const targetTotal = Object.values(T.monthly).reduce((a, b) => a + b, 0)
     + Object.values(T.annual).reduce((a, b) => a + b, 0) / 12;
@@ -390,10 +418,7 @@ function drawControl() {
 
     <h3 class="sh">Category movement</h3>
     ${(() => {
-      const cats = {};
-      for (const t of rows) (cats[groupOf(t)] ||= {})[t.date.slice(0, 7)] =
-        (cats[groupOf(t)][t.date.slice(0, 7)] || 0) + Math.abs(t.amount);
-      const list = Object.entries(cats)
+      const list = Object.entries(byGroup)
         .map(([c, by]) => ({ c, by, avg: months.reduce((a, m) => a + (by[m] || 0), 0) / months.length }))
         .sort((a, b) => b.avg - a.avg);
       return `<table class="heat"><thead><tr><th>Category</th>
@@ -414,13 +439,10 @@ function drawControl() {
       const per = months.map(m => {
         const seg = {}; TIERS.forEach(t => seg[t] = 0);
         const lab = {};
-        for (const t of spendIn([m])) {
-          const ti = tierOfTx(t), v = Math.abs(t.amount);
-          seg[ti] += v;
-          const r = ann.merchantRules[mkey(t)];
-          const key = r?.label || 'Unknown';
-          lab[key] = lab[key] || { v: 0, tier: ti };
-          lab[key].v += v;
+        for (const it of items.filter(x => x.m === m)) {
+          seg[it.tier] += it.v;
+          lab[it.label] = lab[it.label] || { v: 0, tier: it.tier };
+          lab[it.label].v += it.v;
         }
         const top = Object.entries(lab).sort((a, b) => b[1].v - a[1].v).slice(0, 3);
         return { m, seg, top, tot: TIERS.reduce((a, t) => a + seg[t], 0) };
@@ -478,31 +500,13 @@ function drawControl() {
     no merchant rule, but without them the rows would not add up to the bar
     that was tapped — and both are large movers. */
 function breakdown(months) {
-  const skip = excludedRefs();
-  const accByRef = Object.fromEntries((CONF.accounts || []).filter(a => a.match?.ref).map(a => [a.match.ref, a.label]));
   const cats = {};                                   // cat -> { byMonth, subs: sub -> byMonth }
   const put = (cat, sub, m, v) => {
     const c = cats[cat] ||= { byMonth: {}, subs: {} };
     c.byMonth[m] = (c.byMonth[m] || 0) + v;
     (c.subs[sub] ||= {})[m] = (c.subs[sub][m] || 0) + v;
   };
-  for (const t of ledger.transactions) {
-    const m = t.date.slice(0, 7);
-    if (!months.includes(m) || skip.has(t.ref)) continue;
-    if (adjust && ann.oneOffs[t.fp]) continue;
-    if (isSpendRow(t)) {
-      if (ann.workExpenses[t.fp]) continue;
-      const r = ann.merchantRules[mkey(t)];
-      put(r?.group || 'Unknown', r?.label || 'Unlabelled', m, Math.abs(t.amount));
-    } else if (isOther(t)) {
-      const f = flowOf(t);
-      if (f.counts !== 'expenditure') continue;
-      const who = accByRef[t.ref] || ann.swishNames[t.ref] || otherKey(t);
-      put(f.group || 'Uncategorised transfers', f.label || who, m, -t.amount);
-    } else if (isPersonSwish(t)) {
-      put('Swish (net)', ann.swishNames[t.ref] || t.ref, m, -t.amount);
-    }
-  }
+  for (const it of expenditureItems(months)) put(it.group, it.label, it.m, it.v);
   return cats;
 }
 
