@@ -1,4 +1,4 @@
-import * as C from './core.js?v=9';
+import * as C from './core.js?v=10';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -92,7 +92,8 @@ const isPersonSwish = t => roleOf(t) === 'p2p' && (t.ref || '').startsWith('+46'
     excluded on the spending side.
 
     Expenditure is money that leaves and does not come back: personal spending,
-    the recurring obligations you owe, and the net of Swish with people.
+    and the net of Swish with people. Obligations such as the mortgage are
+    categorised here through their counterparty rule, same as any transfer.
     Excluded by design — transfers between your own accounts, Avanza (that is
     saving, not spending), Amex invoice payments (the charges themselves are
     already counted), and any account listed in meta.excludeFromCashflow. */
@@ -319,8 +320,8 @@ function drawControl() {
         <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`;
     }).join('')}</div>
     <p class="note">Everything rounded to the nearest 100 kr. Income counts salary only.
-      Expenditure counts personal spending, recurring obligations and net Swish with people —
-      it excludes transfers between your own accounts, Avanza, Amex invoice payments and lump repayments to your dad.</p>
+      Expenditure counts personal spending and net Swish with people —
+      it excludes transfers between your own accounts, Avanza and Amex invoice payments.</p>
 
     <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
     <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
@@ -432,10 +433,6 @@ function openMonth(m, months) {
       <div class="hdelta ${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr ${gap > 0 ? 'above' : 'below'} average</div>
     </div>
 
-    ${up.length ? `<div class="movers"><b>Biggest movers</b>
-      ${up.map(r => `<span class="mv up">${r.cat} +${krN(r.delta)}</span>`).join('')}
-      ${down.map(r => `<span class="mv dn">${r.cat} −${krN(Math.abs(r.delta))}</span>`).join('')}</div>` : ''}
-
     <div class="dlist">
       <div class="dl-h"><span>Category</span><span class="hcol">This month against average</span>
         <span>This month</span><span>Average</span><span>Difference</span></div>
@@ -461,7 +458,7 @@ function openMonth(m, months) {
       }).join('')}
     </div>
     <p class="note">The grey tick on each bar marks the ${months.length}-month average, which includes this month.
-      Tap any category for its labels. Obligations and net Swish appear as categories so the rows add up.</p>
+      Tap any category for its labels.</p>
   </div></div>`);
 
   document.body.appendChild(modal);
