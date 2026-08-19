@@ -409,17 +409,28 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
   .hrow{grid-template-columns:110px 1fr 88px;gap:8px}
 }
 
-/* ---- tier strip ---- */
+/* ---- tier strip: absolute bars, three figures, top-label chips ---- */
 .tk{display:inline-block;width:11px;height:11px;border-radius:2px}
 .t0{background:var(--navy)}
 .t1{background:#5B7FA6}
 .t2{background:#C9CFD6}
 .tiers{margin-top:4px}
-.trow{display:grid;grid-template-columns:44px 1fr 78px;gap:12px;align-items:center;padding:4px 0}
+.trow,.thead{display:grid;grid-template-columns:40px 1fr 82px 82px 96px;gap:12px;align-items:center}
+.trow{padding:7px 0;border-bottom:1px solid var(--rule-2)}
+.thead{padding-top:8px}
+.thead .tn{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
 .tm{font-size:11.5px;color:var(--muted)}
-.tstack{display:flex;height:16px;border-radius:3px;overflow:hidden;background:var(--rule-2)}
+.ttrack{position:relative;height:18px}
+.tstack{display:flex;height:18px;border-radius:3px;overflow:hidden;min-width:2px}
 .tstack i{display:block;height:100%}
-.tdisc{font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-2)}
+.tavg{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--navy);opacity:.55;
+  text-decoration:none;z-index:2}
+.tn{font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-2)}
+.tchips{grid-column:2/-1;display:flex;gap:6px;flex-wrap:wrap;padding-top:6px}
+.chip3{font-size:11px;font-weight:600;padding:2px 9px;border-radius:11px;white-space:nowrap}
+.chip3.t0{background:var(--surface-2);color:var(--navy)}
+.chip3.t1{background:#E3EAF3;color:#31506F}
+.chip3.t2{background:#EDF0F3;color:#4A5967}
 
 /* ---- category heat table ---- */
 .heat{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px}
@@ -456,7 +467,9 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
   .heat{font-size:11px}.heat td,.heat th{padding:6px 3px}
   .sub-h,.sub-r{grid-template-columns:1fr 78px 90px}
   .sub-h span:nth-child(2),.sub-r .sc{display:none}
-  .trow{grid-template-columns:34px 1fr 66px;gap:8px}
+  .trow,.thead{grid-template-columns:32px 1fr 62px 62px 72px;gap:7px}
+  .tn{font-size:11px}
+  .chip3{font-size:10px;padding:1px 7px}
 }
 
 /* ---- subscriptions: cancellation, kind switch, habit history ---- */
