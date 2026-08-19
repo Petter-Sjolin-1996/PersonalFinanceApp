@@ -1,4 +1,4 @@
-import * as C from './core.js';
+import * as C from './core.js?v=6';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
