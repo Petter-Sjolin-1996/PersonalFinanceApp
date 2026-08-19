@@ -1,4 +1,4 @@
-import * as C from './core.js?v=19';
+import * as C from './core.js?v=20';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -493,6 +493,58 @@ function breakdown(months) {
 
 
 
+
+/* ---------------------------------------------------------- treemap ----- */
+/** Squarified treemap (Bruls, Huizing & van Wijk). Packs items into rows
+    chosen to keep tiles as close to square as possible, which is what makes
+    areas comparable by eye. Laid out in an abstract 1000x560 box and emitted
+    as percentages so it scales to any container. */
+function squarify(items, x, y, w, h, out = []) {
+  if (!items.length || w <= 0 || h <= 0) return out;
+  const total = items.reduce((a, i) => a + i.v, 0);
+  if (total <= 0) return out;
+  const alongHeight = w >= h;
+  const side = alongHeight ? h : w;
+  const row = [];
+  let rowSum = 0, best = Infinity, n = 0;
+  for (; n < items.length; n++) {
+    const s = rowSum + items[n].v;
+    const len = (s / total) * (alongHeight ? w : h);
+    const worst = Math.max(...[...row, items[n]].map(it => {
+      const thick = (it.v / s) * side;
+      return thick && len ? Math.max(len / thick, thick / len) : Infinity;
+    }));
+    if (row.length && worst > best) break;
+    row.push(items[n]); rowSum = s; best = worst;
+  }
+  const len = (rowSum / total) * (alongHeight ? w : h);
+  let off = 0;
+  for (const it of row) {
+    const thick = (it.v / rowSum) * side;
+    out.push(alongHeight ? { ...it, x, y: y + off, w: len, h: thick }
+                         : { ...it, x: x + off, y, w: thick, h: len });
+    off += thick;
+  }
+  return alongHeight ? squarify(items.slice(row.length), x + len, y, w - len, h, out)
+                     : squarify(items.slice(row.length), x, y + len, w, h - len, out);
+}
+
+/** Deviation against the label's own average, clamped, mapped to a colour.
+    Red is spending more than usual, green less — the opposite of a stock
+    heatmap, because here up is the thing to worry about. */
+function devColour(now, avg) {
+  if (!avg) return { bg: '#8E9BAA', fg: '#fff', pct: null };
+  const d = (now - avg) / avg;
+  const k = Math.max(-1, Math.min(1, d / 0.6));
+  const stops = [
+    [-1, '#1E7A4C'], [-0.5, '#4FA97B'], [-0.15, '#A8CDB8'],
+    [0.15, '#E4B4AE'], [0.5, '#CF6B5C'], [1, '#A32B1C'],
+  ];
+  const hit = stops.find(sq => k <= sq[0]) || stops.at(-1);
+  const dark = Math.abs(k) > 0.4;
+  return { bg: hit[1], fg: dark ? '#fff' : '#0E2436', pct: Math.round(d * 100) };
+}
+
 /* ==================================================== MONTH DEEP-DIVE ==== */
 function drawMonth() {
   const all = complete();
@@ -515,6 +567,10 @@ function drawMonth() {
   const mx = Math.max(...cols.map(c => c.total), 1);
   const total = cols.reduce((a, c) => a + c.total, 0);
 
+  const labAvg = {};
+  for (const it of items) (labAvg[it.label] ||= {})[it.m] = (labAvg[it.label][it.m] || 0) + it.v;
+  const avgLabel = l => window12.reduce((a, mm) => a + ((labAvg[l] || {})[mm] || 0), 0) / window12.length;
+
   const avgOf = (fn) => window12.reduce((a, mm) =>
     a + items.filter(i => i.m === mm && fn(i)).reduce((x, i) => x + i.v, 0), 0) / window12.length;
   const totalAvg = avgOf(() => true);
@@ -530,25 +586,37 @@ function drawMonth() {
 
     <div class="insight">${insightFor(m, items, window12)}</div>
 
-    <div class="mchart">${cols.map(c => {
-      const labs = Object.values(c.labels).sort((a, b) => b.v - a.v);
-      const h = c.total / mx * 300;
-      return `<div class="mcol">
-        <span class="mtot">${krN(c.total)}</span>
-        <div class="mstack" style="height:${h}px">
-          ${labs.map(l => `<button class="mseg t${TIERS.indexOf(l.tier)}"
-             style="height:${Math.max(l.v / c.total * h, 11)}px"
-             data-g="${encodeURIComponent(c.group)}" data-l="${encodeURIComponent(l.label)}"
-             title="${l.label} — ${krN(l.v)} kr">${l.v / c.total * h > 22 ? l.label : ''}</button>`).join('')}
-        </div>
-        <span class="mcat">${c.group}</span></div>`;
-    }).join('')}</div>
-    <p class="note">One column per category, tallest first, split by label. Tap any block for its transactions.
-      Very small blocks are drawn at a minimum height so they stay tappable, so those are not to scale.</p>`;
+    <div class="legend legend2"><span>Against each label's own average</span>
+      ${[['#1E7A4C','−60%'],['#4FA97B',''],['#A8CDB8',''],['#E4B4AE',''],['#CF6B5C',''],['#A32B1C','+60%']]
+        .map(([c, l]) => `<span class="lg"><i style="background:${c}"></i>${l}</span>`).join('')}</div>
+    <div class="tmap">${(() => {
+      const boxes = squarify(cols.map(c => ({ ...c, v: c.total })), 0, 0, 1000, 560);
+      return boxes.map(b => {
+        const labs = Object.values(b.labels).sort((a, l) => l.v - a.v).map(l => ({ ...l, v: l.v }));
+        const head = Math.min(20, b.h * 0.16);
+        const inner = squarify(labs, b.x + 1, b.y + head, Math.max(b.w - 2, 1), Math.max(b.h - head - 1, 1));
+        return `<div class="tgrp" style="left:${b.x / 10}%;top:${b.y / 5.6}%;width:${b.w / 10}%;height:${b.h / 5.6}%">
+            <span class="tgh">${b.group} <em>${krN(b.total)}</em></span></div>` +
+          inner.map(t => {
+            const avg = avgLabel(t.label);
+            const col = devColour(t.v, avg);
+            const showName = t.w > 68 && t.h > 26;
+            const showVal = t.w > 68 && t.h > 46;
+            return `<button class="tile" style="left:${t.x / 10}%;top:${t.y / 5.6}%;width:${t.w / 10}%;height:${t.h / 5.6}%;background:${col.bg};color:${col.fg}"
+              data-g="${encodeURIComponent(b.group)}" data-l="${encodeURIComponent(t.label)}"
+              title="${t.label} — ${krN(t.v)} kr${col.pct !== null ? `, ${col.pct > 0 ? '+' : ''}${col.pct}% against its average` : ''}">
+              ${showName ? `<b>${t.label}</b>` : ''}${showVal ? `<i>${krN(t.v)}</i>` : ''}</button>`;
+          }).join('');
+      }).join('');
+    })()}</div>
+    <p class="note">Every label in the month, sized by amount and grouped into its category.
+      Colour is that label against its own ${window12.length}-month average — red is more than usual,
+      green is less, so the eye goes to what changed rather than to what is merely big.
+      Tap any tile for its transactions.</p>`;
 
   $('mPrev').onclick = () => { monthCursor--; drawMonth(); };
   $('mNext').onclick = () => { monthCursor++; drawMonth(); };
-  host.querySelectorAll('.mseg').forEach(b => b.onclick = () =>
+  host.querySelectorAll('.tile').forEach(b => b.onclick = () =>
     openSeg(m, decodeURIComponent(b.dataset.g), decodeURIComponent(b.dataset.l)));
 }
 
