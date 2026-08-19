@@ -1,4 +1,4 @@
-import * as C from './core.js?v=8';
+import * as C from './core.js?v=9';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -407,42 +407,61 @@ function openMonth(m, months) {
   const down = movers.filter(r => r.delta < 0).slice(-2).reverse();
   const scale = Math.max(...rows.flatMap(r => [r.now, r.avg]), 1);
 
+  // one shared scale, zero-anchored so a negative net Swish reads correctly
+  const maxPos = Math.max(...rows.flatMap(r => [r.now, r.avg, 0]));
+  const maxNeg = Math.abs(Math.min(...rows.flatMap(r => [r.now, r.avg, 0])));
+  const span = maxPos + maxNeg || 1;
+  const zero = maxNeg / span * 100;
+  const seg = v => v >= 0
+    ? { left: zero, width: v / span * 100 }
+    : { left: zero - Math.abs(v) / span * 100, width: Math.abs(v) / span * 100 };
+  const tick = v => zero + v / span * 100;
+
+  const headScale = Math.max(total, totAvg, 1);
+  const bar = (v, cls) => `<div class="hbar"><i class="${cls}" style="width:${v / headScale * 100}%"></i></div>`;
+
   const modal = el(`<div class="modal" id="monthModal"><div class="sheet wide drill">
     <div class="dhead">
-      <div><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2>
-        <p class="dsum">Expenditure <b>${krN(total)} kr</b> ·
-          <span class="${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr</span>
-          against the ${months.length}-month average of ${krN(totAvg)} kr</p></div>
+      <div><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2></div>
       <button class="xclose" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="hcompare">
+      <div class="hrow"><span class="hlab">This month</span>${bar(total, 'in')}<span class="hval">${krN(total)} kr</span></div>
+      <div class="hrow"><span class="hlab">${months.length}-month average</span>${bar(totAvg, 'out')}<span class="hval muted">${krN(totAvg)} kr</span></div>
+      <div class="hdelta ${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr ${gap > 0 ? 'above' : 'below'} average</div>
     </div>
 
     ${up.length ? `<div class="movers"><b>Biggest movers</b>
       ${up.map(r => `<span class="mv up">${r.cat} +${krN(r.delta)}</span>`).join('')}
       ${down.map(r => `<span class="mv dn">${r.cat} −${krN(Math.abs(r.delta))}</span>`).join('')}</div>` : ''}
 
-    <div class="legend"><span><i class="sw-in"></i>This month</span><span><i class="sw-out"></i>${months.length}-month average</span></div>
-    <div class="dchart">${rows.map(r => `<div class="dcol">
-      <span class="fnum">${krN(r.now)}</span>
-      <div class="dbars">
-        <div class="fb in" style="height:${Math.max(r.now / scale * 100, 0)}%"></div>
-        <div class="fb out" style="height:${Math.max(r.avg / scale * 100, 0)}%"></div>
-      </div>
-      <span class="dlab">${r.cat}</span></div>`).join('')}</div>
-
     <div class="dlist">
-      <div class="dl-h"><span>Category</span><span>This month</span><span>Average</span><span>Difference</span></div>
-      ${rows.map((r, i) => `<div class="dl-r" data-i="${i}" role="button" tabindex="0">
+      <div class="dl-h"><span>Category</span><span class="hcol">This month against average</span>
+        <span>This month</span><span>Average</span><span>Difference</span></div>
+      ${rows.map((r, i) => {
+        const b = seg(r.now);
+        return `<div class="dl-r" data-i="${i}" role="button" tabindex="0">
           <b>${r.cat}<span class="chev">›</span></b>
-          <span class="v">${krN(r.now)}</span><span class="v">${krN(r.avg)}</span>
+          <div class="cbar"><u class="zero" style="left:${zero}%"></u>
+            <i class="${r.now < 0 ? 'neg' : ''}" style="left:${b.left}%;width:${b.width}%"></i>
+            <u class="avg" style="left:${tick(r.avg)}%"></u></div>
+          <span class="v">${krN(r.now)}</span>
+          <span class="v muted">${krN(r.avg)}</span>
           <span class="v ${r.delta > 0 ? 'over' : 'under'}">${r.delta > 0 ? '+' : '−'}${krN(Math.abs(r.delta))}</span>
         </div>
         <div class="dl-sub" data-sub="${i}" hidden>${r.subs.map(s => `<div class="dl-s">
-          <span>${s.label}</span><span class="v">${krN(s.now)}</span><span class="v muted">${krN(s.avg)}</span>
+          <span>${s.label}</span>
+          <div class="cbar sub"><u class="zero" style="left:${zero}%"></u>
+            <i class="${s.now < 0 ? 'neg' : ''}" style="left:${seg(s.now).left}%;width:${seg(s.now).width}%"></i>
+            <u class="avg" style="left:${tick(s.avg)}%"></u></div>
+          <span class="v">${krN(s.now)}</span><span class="v muted">${krN(s.avg)}</span>
           <span class="v ${s.now - s.avg > 0 ? 'over' : 'under'}">${s.now - s.avg > 0 ? '+' : '−'}${krN(Math.abs(s.now - s.avg))}</span>
-        </div>`).join('') || '<div class="dl-s"><span>No detail</span></div>'}</div>`).join('')}
+        </div>`).join('') || '<div class="dl-s"><span>No detail</span></div>'}</div>`;
+      }).join('')}
     </div>
-    <p class="note">The average includes this month. Tap any category for its labels.
-      Obligations and net Swish appear as categories so the rows add up to the bar you tapped.</p>
+    <p class="note">The grey tick on each bar marks the ${months.length}-month average, which includes this month.
+      Tap any category for its labels. Obligations and net Swish appear as categories so the rows add up.</p>
   </div></div>`);
 
   document.body.appendChild(modal);
