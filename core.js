@@ -284,7 +284,17 @@ export function merge(existing, incoming) {
 
 /* --------------------------------------------------------------- GitHub -- */
 
-const b64encode = s => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+/** Chunked on purpose: String.fromCharCode(...bytes) spreads every byte into
+    an argument list, which overflows the call stack somewhere above ~120 kB.
+    ledger.json passes that the moment a year of transactions is in it. */
+const b64encode = s => {
+  const bytes = new TextEncoder().encode(s);
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += CHUNK)
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  return btoa(bin);
+};
 const b64decode = s => new TextDecoder().decode(
   Uint8Array.from(atob(s.replace(/\s/g, '')), c => c.charCodeAt(0)));
 
