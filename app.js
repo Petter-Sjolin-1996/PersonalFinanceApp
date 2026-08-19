@@ -1,4 +1,4 @@
-import * as C from './core.js?v=10';
+import * as C from './core.js?v=12';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -17,7 +17,7 @@ const FALLBACK_CATS = [
 
 const CFG_KEY = 'ledger.cfg';
 const SECTIONS = {
-  control:      [['overview','Overview'], ['targets','Targets']],
+  control:      [['overview','Overview'], ['subs','Subscriptions'], ['targets','Targets']],
   transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
   categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'],
                  ['swish','Swish counterparties'], ['other','Transfers & income']],
@@ -43,6 +43,47 @@ const groups = () => {
   for (const c of CONF.categories) { if (!g.has(c.group)) g.set(c.group, []); g.get(c.group).push(c); }
   return g;
 };
+const TIERS = ['Must have','Essentials','Discretionary'];
+const tierOf = (g, l) => CONF.categories.find(c => c.group === g && c.label === l)?.tier || 'Discretionary';
+const tierOfTx = t => {
+  const r = ann.merchantRules[mkey(t)];
+  return r?.group ? tierOf(r.group, r.label) : 'Discretionary';
+};
+
+/** Recurrence is detected, not labelled. A merchant seen in most months is
+    recurring; if the amount barely moves it is a subscription you cancel once,
+    if it swings it is a habit you simply do less of. */
+function recurring(months) {
+  const cfgR = CONF.meta.recurring || {};
+  const minMonths = Math.max(2, Math.ceil(months.length * (cfgR.minMonthsShare ?? 0.6)));
+  const cv = cfgR.subscriptionCV ?? 0.15;
+  const by = new Map();
+  for (const t of spendRows()) {
+    const m = t.date.slice(0, 7);
+    if (!months.includes(m) || ann.workExpenses[t.fp]) continue;
+    const k = mkey(t);
+    const e = by.get(k) || { merchant: k, per: {}, total: 0 };
+    e.per[m] = (e.per[m] || 0) + Math.abs(t.amount);
+    e.total += Math.abs(t.amount);
+    by.set(k, e);
+  }
+  const out = [];
+  for (const e of by.values()) {
+    const seen = Object.keys(e.per).length;
+    if (seen < minMonths) continue;
+    const vals = Object.values(e.per);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+    const rule = ann.merchantRules[e.merchant] || {};
+    out.push({ ...e, seen, mean, cv: mean ? sd / mean : 1,
+               kind: mean && sd / mean <= cv ? 'subscription' : 'habit',
+               tier: rule.group ? tierOf(rule.group, rule.label) : 'Discretionary',
+               cat: rule.group ? rule.group + ' / ' + rule.label : '—',
+               perYear: e.total / months.length * 12 });
+  }
+  return out.sort((a, b) => b.perYear - a.perYear);
+}
+
 const defaultFixed = (g, l) => !!CONF.categories.find(c => c.group === g && c.label === l)?.fixed;
 const ruleCount = (g, l) => Object.values(ann.merchantRules).filter(r => r.group === g && r.label === l).length;
 
@@ -248,7 +289,7 @@ function go(sec, p) {
   $('subnav').hidden = panes.length < 2;
 
   const show = {
-    overview: 'viewControl', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
+    overview: 'viewControl', subs: 'viewSubs', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
     expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish', other: 'viewOther',
   };
   for (const v of Object.values(show)) $(v).hidden = true;
@@ -259,7 +300,7 @@ function go(sec, p) {
   const n = unconfirmed() + corpUnreviewed() + swishUnnamed() + otherUnruled();
   $('navBadge').textContent = n; $('navBadge').hidden = !n;
 
-  ({ overview: drawControl, targets: drawTargets, import: drawImport, coverage: drawCoverage,
+  ({ overview: drawControl, subs: drawSubs, targets: drawTargets, import: drawImport, coverage: drawCoverage,
      expenses: render, corp: renderCorp, swish: renderSwish, other: renderOther })[pane]();
 }
 document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dataset.s));
@@ -322,6 +363,41 @@ function drawControl() {
     <p class="note">Everything rounded to the nearest 100 kr. Income counts salary only.
       Expenditure counts personal spending and net Swish with people —
       it excludes transfers between your own accounts, Avanza and Amex invoice payments.</p>
+
+    <h3 class="sh">Where the money goes</h3>
+    <div class="legend">${TIERS.map((t, i) => `<span><i class="tk t${i}"></i>${t}</span>`).join('')}</div>
+    <div class="tiers">${months.map(m => {
+      const seg = {}; TIERS.forEach(t => seg[t] = 0);
+      spendIn([m]).forEach(t => seg[tierOfTx(t)] += Math.abs(t.amount));
+      const tot = TIERS.reduce((a, t) => a + seg[t], 0) || 1;
+      return `<div class="trow"><span class="tm">${monthName(m).slice(0, 3)}</span>
+        <div class="tstack">${TIERS.map((t, i) =>
+          `<i class="t${i}" style="width:${seg[t] / tot * 100}%" title="${t} ${krN(seg[t])} kr"></i>`).join('')}</div>
+        <span class="tdisc">${krN(seg['Discretionary'])}</span></div>`;
+    }).join('')}</div>
+    <p class="note">Bar widths are shares of that month. The figure on the right is discretionary spending —
+      the part decided purchase by purchase. Averaging <b>${krN(months.reduce((a, m) =>
+        a + spendIn([m]).filter(t => tierOfTx(t) === 'Discretionary').reduce((x, t) => x + Math.abs(t.amount), 0), 0) / months.length)} kr</b> a month.</p>
+
+    <h3 class="sh">Category movement</h3>
+    ${(() => {
+      const cats = {};
+      for (const t of rows) (cats[groupOf(t)] ||= {})[t.date.slice(0, 7)] =
+        (cats[groupOf(t)][t.date.slice(0, 7)] || 0) + Math.abs(t.amount);
+      const list = Object.entries(cats)
+        .map(([c, by]) => ({ c, by, avg: months.reduce((a, m) => a + (by[m] || 0), 0) / months.length }))
+        .sort((a, b) => b.avg - a.avg);
+      return `<table class="heat"><thead><tr><th>Category</th>
+        ${months.map(m => `<th>${monthName(m).slice(0, 3)}</th>`).join('')}<th>Avg</th></tr></thead><tbody>
+        ${list.map(r => `<tr><td class="hc">${r.c}</td>
+          ${months.map(m => {
+            const v = r.by[m] || 0, d = r.avg ? (v - r.avg) / r.avg : 0;
+            const lvl = Math.min(3, Math.floor(Math.abs(d) / 0.35));
+            return `<td class="${d > 0 ? 'hi' : 'lo'}${lvl}">${krN(v)}</td>`;
+          }).join('')}<td class="hav">${krN(r.avg)}</td></tr>`).join('')}
+      </tbody></table>
+      <p class="note">Shaded against each category's own average — darker red is further above, darker blue further below.</p>`;
+    })()}
 
     <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
     <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
@@ -942,8 +1018,8 @@ function openConfig() {
   $('confModal')?.remove();
   const m = el(`<div class="modal" id="confModal"><div class="sheet wide">
     <h2>Categories &amp; settings</h2>
-    <p class="lede">Stored in <b>config.json</b> in your private repo. Renaming a label rewrites every merchant
-      rule that points at it. Deleting one is refused while rules still use it.</p>
+    <p class="lede">Stored in <b>config.json</b> in your private repo. The tier decides whether spending counts as
+      must have, essential or discretionary. Renaming a label rewrites every merchant rule that points at it.</p>
     <div id="confList"></div>
     <div class="addrow"><input id="newGroup" placeholder="New group name" autocapitalize="words">
       <button class="btn" id="addGroup">Add group</button></div>
@@ -982,6 +1058,7 @@ function drawConfig() {
     for (const c of list) {
       const used = ruleCount(c.group, c.label);
       const row = el(`<div class="crow"><input class="cname" value="${c.label.replace(/"/g, '&quot;')}">
+        <select class="ctier">${TIERS.map(t => `<option${t === (c.tier || 'Discretionary') ? ' selected' : ''}>${t}</option>`).join('')}</select>
         <label class="mini"><input type="checkbox" class="cfix" ${c.fixed ? 'checked' : ''}> Fixed</label>
         <span class="cuse num">${used ? used + ' in use' : 'unused'}</span>
         <button class="cdel" title="Delete">&times;</button></div>`);
@@ -995,6 +1072,7 @@ function drawConfig() {
         c.label = to; confDirty = true; markDirty(); drawConfig(); render();
         toast(used ? `Renamed — ${used} merchant rule(s) updated` : 'Renamed');
       };
+      row.querySelector('.ctier').onchange = e => { c.tier = e.target.value; confDirty = true; markDirty(); };
       row.querySelector('.cfix').onchange = e => { c.fixed = e.target.checked; confDirty = true; markDirty(); };
       row.querySelector('.cdel').onclick = () => {
         if (used) return toast(`Still used by ${used} merchant(s) — move them first`);
