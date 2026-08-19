@@ -79,6 +79,38 @@ function spendIn(months) {
     !(adjust && ann.oneOffs[t.fp]));
 }
 const groupOf = t => ann.merchantRules[mkey(t)]?.group || 'Unknown';
+const isSpendRow = t =>
+  ((t.role === 'spend' || t.role === 'fee') && t.account !== 'amex_corp') ||
+  (t.role === 'p2p' && !(t.ref || '').startsWith('+46'));
+
+/** Money in and money out, per month.
+    Income is salary only — reimbursements repay work expenses you fronted,
+    they are not earnings. Expenditure is everything that leaves and does not
+    come back: personal spending, obligations you owe (the mortgage to Dad,
+    your mother's phone), and the net of Swish with people. Transfers to your
+    own accounts and to Avanza are excluded — that is saving, not spending. */
+function cashByMonth(months) {
+  const out = {};
+  months.forEach(m => out[m] = { income: 0, spend: 0 });
+  for (const t of ledger.transactions) {
+    const m = t.date.slice(0, 7);
+    if (!out[m]) continue;
+    if (adjust && ann.oneOffs[t.fp]) continue;
+    if (t.role === 'income') out[m].income += t.amount;
+    else if (isSpendRow(t)) { if (!ann.workExpenses[t.fp]) out[m].spend += Math.abs(t.amount); }
+    else if (t.role === 'transfer_obligation') out[m].spend += Math.abs(t.amount);
+    else if (t.role === 'p2p') out[m].spend -= t.amount;      // net: sent adds, received subtracts
+  }
+  for (const m of months) out[m].net = out[m].income - out[m].spend;
+  return out;
+}
+const r100 = n => Math.round(n / 100) * 100;
+const krR = n => r100(n).toLocaleString('sv-SE') + ' kr';
+const delta = (latest, avg) => {
+  const d = r100(latest - avg);
+  if (!d) return 'in line with the average';
+  return `${Math.abs(d).toLocaleString('sv-SE')} kr ${d > 0 ? 'above' : 'below'} the average`;
+};
 
 /* ------------------------------------------------------------- counts ---- */
 const unconfirmed = () => merchants().filter(m => !ann.merchantRules[m.merchant]?.confirmed).length;
@@ -172,47 +204,59 @@ document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dat
 /* ==================================================== EXPENSE CONTROL ==== */
 function drawControl() {
   const host = $('viewControl');
-  const months = complete();
-  if (!months.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3><p>Import a full month for every account and this fills in.</p></div>'; return; }
+  const all = complete();
+  if (!all.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3><p>Import a full month for every account and this fills in.</p></div>'; return; }
+  const months = all.slice(-12);                    // rolling 12, or everything we have
+  const cash = cashByMonth(months);
+  const last = months.at(-1);
+  const mean = k => months.reduce((a, m) => a + cash[m][k], 0) / months.length;
+  const avgIn = mean('income'), avgOut = mean('spend'), avgNet = avgIn - avgOut;
 
   const rows = spendIn(months);
-  const byMonth = {}; months.forEach(m => byMonth[m] = 0);
   const byGroup = {};
   for (const t of rows) {
-    byMonth[t.date.slice(0, 7)] += Math.abs(t.amount);
-    (byGroup[groupOf(t)] ||= {})[t.date.slice(0, 7)] = (byGroup[groupOf(t)][t.date.slice(0, 7)] || 0) + Math.abs(t.amount);
+    const m = t.date.slice(0, 7);
+    (byGroup[groupOf(t)] ||= {})[m] = (byGroup[groupOf(t)][m] || 0) + Math.abs(t.amount);
   }
-  const last = months.at(-1);
-  const total = Object.values(byMonth).reduce((a, b) => a + b, 0);
-  const avg = total / months.length;
   const T = CONF.targets;
-  const monthlyTargetTotal = Object.values(T.monthly).reduce((a, b) => a + b, 0)
+  const targetTotal = Object.values(T.monthly).reduce((a, b) => a + b, 0)
     + Object.values(T.annual).reduce((a, b) => a + b, 0) / 12;
-  const lastTotal = byMonth[last];
   const oneOffCount = Object.keys(ann.oneOffs).length;
+  const scale = Math.max(...months.flatMap(m => [cash[m].income, cash[m].spend]), 1);
+  const netAbsMax = Math.max(...months.map(m => Math.abs(cash[m].net)), 1);
 
   host.innerHTML = `
     <div class="kpi">
-      <div class="stat"><b>${monthName(last)} — last complete month</b><span>${kr(lastTotal)}</span>
-        <small>${lastTotal > monthlyTargetTotal ? kr(lastTotal - monthlyTargetTotal) + ' over' : kr(monthlyTargetTotal - lastTotal) + ' under'} target</small></div>
-      <div class="stat"><b>Average per month</b><span>${kr(avg)}</span><small>across ${months.length} complete months</small></div>
-      <div class="stat big"><b>Monthly target, all groups</b><span>${kr(monthlyTargetTotal)}</span>
-        <small>monthly targets plus annual budgets ÷ 12</small></div>
+      <div class="stat"><b>Average income</b><span>${krR(avgIn)}</span>
+        <small>${monthName(last)}: ${krR(cash[last].income)} — ${delta(cash[last].income, avgIn)}</small></div>
+      <div class="stat"><b>Average expenditure</b><span>${krR(avgOut)}</span>
+        <small>${monthName(last)}: ${krR(cash[last].spend)} — ${delta(cash[last].spend, avgOut)}</small></div>
+      <div class="stat big"><b>Average net savings</b><span>${krR(avgNet)}</span>
+        <small>${monthName(last)}: ${krR(cash[last].net)} — ${delta(cash[last].net, avgNet)}</small></div>
     </div>
 
-    <div class="verdict">Showing <b>${adjust ? 'spending excluding one-offs' : 'raw spending'}</b> for
-      ${months.length} complete months, ${monthName(months[0])} to ${monthName(last)}.
-      ${oneOffCount ? `${oneOffCount} transaction${oneOffCount > 1 ? 's are' : ' is'} marked one-off.` : 'Nothing is marked as a one-off yet.'}</div>
+    <div class="verdict">Averages are a rolling <b>${months.length} month${months.length > 1 ? 's' : ''}</b>${
+      months.length < 12 ? ' — everything complete so far, building towards 12' : ''}, ${monthName(months[0])} to ${monthName(last)}.
+      Showing <b>${adjust ? 'figures excluding one-offs' : 'raw figures'}</b>.
+      ${oneOffCount ? `${oneOffCount} transaction${oneOffCount > 1 ? 's are' : ' is'} marked one-off.` : 'Nothing is marked one-off yet.'}</div>
     <div style="margin-top:12px"><label class="toggle"><input type="checkbox" id="adj" ${adjust ? 'checked' : ''}> Exclude one-offs</label></div>
 
-    <h3 class="sh">Total spend by month</h3>
-    <div class="trend">${months.map(m => {
-      const v = byMonth[m], h = Math.max(4, v / Math.max(...Object.values(byMonth)) * 108);
-      return `<div class="tcol"><span class="tval">${kr0(v / 1000 * 10 / 10)}k</span>
-        <div class="tbar ${v > monthlyTargetTotal ? 'over' : ''}" style="height:${h}px"></div>
+    <h3 class="sh">Income, expenditure and net by month</h3>
+    <div class="flow">${months.map(m => {
+      const c = cash[m], neg = c.net < 0;
+      const size = 34 + Math.abs(c.net) / netAbsMax * 20;
+      return `<div class="fcol">
+        <div class="bubble ${neg ? 'neg' : ''}" style="width:${size}px;height:${size}px"
+             title="net ${krR(c.net)}">${r100(c.net / 1000 * 10) / 10}k</div>
+        <div class="fbars">
+          <div class="fb in" style="height:${c.income / scale * 100}%" title="income ${krR(c.income)}"></div>
+          <div class="fb out" style="height:${c.spend / scale * 100}%" title="expenditure ${krR(c.spend)}"></div>
+        </div>
         <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`;
     }).join('')}</div>
-    <p class="note">Bars in red exceed the combined monthly target of ${kr(monthlyTargetTotal)}.</p>
+    <p class="note"><i class="sw-in"></i> income &nbsp; <i class="sw-out"></i> expenditure &nbsp;
+      the circle is net savings, sized by magnitude. Everything rounded to the nearest 100 kr.
+      Income counts salary only; expenditure counts personal spending, obligations and net Swish with people.</p>
 
     <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
     <div class="tgt"><div class="tgt-h"><span>Group</span><span>Actual</span><span>Target</span><span>Progress</span></div>
@@ -228,14 +272,14 @@ function drawControl() {
       ${Object.keys(T.annual).sort().map(g => {
         const used = Object.values(byGroup[g] || {}).reduce((a, b) => a + b, 0);
         const b = T.annual[g], pct = b ? Math.min(used / b * 100, 100) : 0;
-        const pace = months.length / 12 * 100;
+        const pace = all.length / 12 * 100;
         return `<div class="tgt-r"><b>${g}</b>
-          <span class="v ${used > b * months.length / 12 ? 'over' : 'under'}">${kr(used)}</span>
+          <span class="v ${used > b * all.length / 12 ? 'over' : 'under'}">${kr(used)}</span>
           <span class="v">${kr(b)}</span>
           <div class="bar"><i class="${used > b ? 'over' : ''}" style="width:${pct}%"></i><u style="left:${pace}%"></u></div></div>`;
       }).join('')}</div>
     <p class="note">The vertical marker shows where you would be if spending were even across the year
-      — ${months.length} of 12 months elapsed.</p>`;
+      — ${all.length} of 12 months elapsed.</p>`;
 
   $('adj').onchange = e => { adjust = e.target.checked; drawControl(); };
 }
@@ -733,8 +777,6 @@ addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.retur
 
 /* ---------------------------------------------------------------- boot --- */
 function boot() {
-  const tx = ledger.transactions;
-  $('win').textContent = tx.length ? ` ${tx[0].date.slice(0, 7)} → ${tx.at(-1).date.slice(0, 7)}` : '';
   $('confBtn').hidden = false;
   go(unconfirmed() ? 'categorise' : 'control');
 }
