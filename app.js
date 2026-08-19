@@ -1,4 +1,4 @@
-import * as C from './core.js?v=15';
+import * as C from './core.js?v=17';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -16,6 +16,7 @@ const FALLBACK_CATS = [
 ].flatMap(([group, labels]) => labels.map(label => ({ group, label, fixed: false })));
 
 const CFG_KEY = 'ledger.cfg';
+const SEEN_KEY = 'ledger.lastSaved';   // stamp of the newest annotations this device wrote
 const SECTIONS = {
   control:      [['overview','Overview'], ['subs','Subscriptions'], ['targets','Targets']],
   transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
@@ -28,7 +29,7 @@ let CONF = null, shaC = null, confDirty = false;
 let ledger = null, ann = null, shaL = null, shaA = null;
 let dirty = false, section = 'control', pane = 'overview';
 let filter = 'todo', sort = 'value', query = '', adjust = false;
-let pendingImport = null;
+let pendingImport = null, staleWarning = null;
 
 const $ = id => document.getElementById(id);
 const el = h => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
@@ -260,6 +261,19 @@ async function connect() {
   if (!CONF.accounts?.length) CONF.accounts = ledger.accounts || [];
   ann = A ? A.json : { version: 1 };
   shaA = A ? A.sha : null;
+
+  /* Guard against an older annotations.json being uploaded over a newer one.
+     Every save records its stamp on this device; if the file that comes back
+     is older than that, something overwrote your work and we say so loudly
+     rather than letting you carry on editing a stale copy. */
+  const seen = localStorage.getItem(SEEN_KEY);
+  staleWarning = (seen && ann.updated && ann.updated < seen)
+    ? `<b>The labelling in GitHub is older than the last version this device saved.</b>
+       It was last written ${ann.updated.slice(0, 16).replace('T', ' ')}, but this device saved a newer one at
+       ${seen.slice(0, 16).replace('T', ' ')}. Something has overwritten your work — most likely an
+       <code>annotations.json</code> uploaded by hand. Before editing anything, open
+       <b>${cfg.repo} → annotations.json → History</b> on GitHub and restore the newer version.`
+    : null;
   for (const k of ['merchantRules','swishNames','workExpenses','corporatePrivate','oneOffs','transferRules','txOverrides','recurring']) ann[k] ||= {};
   dirty = false; confDirty = false; setSync('on', 'synced');
 }
@@ -270,6 +284,7 @@ async function save() {
   try {
     ann.updated = new Date().toISOString();
     shaA = await repo.write('annotations.json', ann, shaA, 'Update annotations');
+    localStorage.setItem(SEEN_KEY, ann.updated);
     if (confDirty) {
       CONF.updated = new Date().toISOString();
       shaC = await repo.write('config.json', CONF, shaC, 'Update configuration');
@@ -373,21 +388,6 @@ function drawControl() {
       Expenditure counts personal spending and net Swish with people —
       it excludes transfers between your own accounts, Avanza and Amex invoice payments.</p>
 
-    <h3 class="sh">Where the money goes</h3>
-    <div class="legend">${TIERS.map((t, i) => `<span><i class="tk t${i}"></i>${t}</span>`).join('')}</div>
-    <div class="tiers">${months.map(m => {
-      const seg = {}; TIERS.forEach(t => seg[t] = 0);
-      spendIn([m]).forEach(t => seg[tierOfTx(t)] += Math.abs(t.amount));
-      const tot = TIERS.reduce((a, t) => a + seg[t], 0) || 1;
-      return `<div class="trow"><span class="tm">${monthName(m).slice(0, 3)}</span>
-        <div class="tstack">${TIERS.map((t, i) =>
-          `<i class="t${i}" style="width:${seg[t] / tot * 100}%" title="${t} ${krN(seg[t])} kr"></i>`).join('')}</div>
-        <span class="tdisc">${krN(seg['Discretionary'])}</span></div>`;
-    }).join('')}</div>
-    <p class="note">Bar widths are shares of that month. The figure on the right is discretionary spending —
-      the part decided purchase by purchase. Averaging <b>${krN(months.reduce((a, m) =>
-        a + spendIn([m]).filter(t => tierOfTx(t) === 'Discretionary').reduce((x, t) => x + Math.abs(t.amount), 0), 0) / months.length)} kr</b> a month.</p>
-
     <h3 class="sh">Category movement</h3>
     ${(() => {
       const cats = {};
@@ -406,6 +406,41 @@ function drawControl() {
           }).join('')}<td class="hav">${krN(r.avg)}</td></tr>`).join('')}
       </tbody></table>
       <p class="note">Shaded against each category's own average — darker red is further above, darker blue further below.</p>`;
+    })()}
+
+    <h3 class="sh">Where the money goes</h3>
+    <div class="legend">${TIERS.map((t, i) => `<span><i class="tk t${i}"></i>${t}</span>`).join('')}</div>
+    ${(() => {
+      const per = months.map(m => {
+        const seg = {}; TIERS.forEach(t => seg[t] = 0);
+        const lab = {};
+        for (const t of spendIn([m])) {
+          const ti = tierOfTx(t), v = Math.abs(t.amount);
+          seg[ti] += v;
+          const r = ann.merchantRules[mkey(t)];
+          const key = r?.label || 'Unknown';
+          lab[key] = lab[key] || { v: 0, tier: ti };
+          lab[key].v += v;
+        }
+        const top = Object.entries(lab).sort((a, b) => b[1].v - a[1].v).slice(0, 3);
+        return { m, seg, top, tot: TIERS.reduce((a, t) => a + seg[t], 0) };
+      });
+      const mx = Math.max(...per.map(p => p.tot), 1);
+      const avg = per.reduce((a, p) => a + p.tot, 0) / per.length;
+      return `<div class="tiers">${per.map(p => `<div class="trow">
+        <span class="tm">${monthName(p.m).slice(0, 3)}</span>
+        <div class="ttrack"><u class="tavg" style="left:${avg / mx * 100}%"></u>
+          <div class="tstack" style="width:${p.tot / mx * 100}%">
+            ${TIERS.map((t, i) => `<i class="t${i}" style="width:${p.seg[t] / (p.tot || 1) * 100}%"
+              title="${t} ${krN(p.seg[t])} kr"></i>`).join('')}</div></div>
+        ${TIERS.map(t => `<span class="tn">${krN(p.seg[t])}</span>`).join('')}
+        <div class="tchips">${p.top.map(([label, o]) =>
+          `<span class="chip3 t${TIERS.indexOf(o.tier)}">${label}</span>`).join('')}</div>
+      </div>`).join('')}</div>
+      <div class="thead"><span></span><span></span>${TIERS.map(t => `<span class="tn">${t}</span>`).join('')}</div>
+      <p class="note">Bars are absolute, so length is total spend that month; the vertical line marks the
+        ${months.length}-month average of ${krN(avg)} kr. Chips are the three largest labels of the month,
+        coloured by tier. Discretionary averages <b>${krN(per.reduce((a, p) => a + p.seg['Discretionary'], 0) / per.length)} kr</b> a month.</p>`;
     })()}
 
     <h3 class="sh">Monthly targets — ${monthName(last)}</h3>
@@ -1242,7 +1277,7 @@ $('setSave').onclick = async () => {
   try {
     await connect();
     localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
-    $('setModal').hidden = true; banner(''); boot();
+    $('setModal').hidden = true; banner(staleWarning || ''); boot();
   } catch (e) { $('setMsg').className = 'msg bad'; $('setMsg').textContent = e.message; setSync('err', 'error'); }
 };
 
@@ -1276,6 +1311,6 @@ function boot() {
     setSync('err', 'not set up');
     return;
   }
-  try { await connect(); boot(); }
+  try { await connect(); boot(); if (staleWarning) banner(staleWarning); }
   catch (e) { setSync('err', 'error'); banner(e.message + ' — open Settings to check your details.'); }
 })();
