@@ -511,3 +511,44 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
 .mom.up{color:var(--neg)}
 .mom.dn{color:var(--pos)}
 .mom.flat{color:var(--muted)}
+
+/* ---- month deep-dive ---- */
+.mnav{display:flex;align-items:center;justify-content:center;gap:22px;margin:4px 0 18px}
+.mnow{text-align:center}
+.mnow h2{font-size:21px}
+.mnow span{display:block;font-size:13px;color:var(--ink-2);margin-top:4px}
+.narw{border:1px solid var(--rule);background:var(--paper);color:var(--navy);width:38px;height:38px;
+  border-radius:50%;font-size:20px;line-height:1;cursor:pointer}
+.narw:hover:not(:disabled){border-color:var(--navy)}
+.narw:disabled{opacity:.3;cursor:default}
+.insight{background:var(--surface);border-left:3px solid var(--blue);padding:15px 18px;
+  border-radius:0 var(--r) var(--r) 0;font-size:14px;line-height:1.65;margin-bottom:24px}
+.insight b{font-variant-numeric:tabular-nums}
+
+.mchart{display:flex;gap:10px;align-items:flex-end;overflow-x:auto;padding-bottom:4px;
+  border-bottom:1px solid var(--rule)}
+.mcol{flex:1;min-width:74px;display:flex;flex-direction:column;align-items:center;gap:6px}
+.mtot{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.mstack{width:100%;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px;overflow:hidden}
+.mseg{border:0;border-bottom:1px solid rgba(255,255,255,.7);cursor:pointer;padding:0 4px;
+  font:500 9.5px "Inter",sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  display:flex;align-items:center;justify-content:center;width:100%}
+.mseg:last-child{border-bottom:0}
+.mseg.t0{background:var(--navy);color:#fff}
+.mseg.t1{background:#5B7FA6;color:#fff}
+.mseg.t2{background:#C9CFD6;color:var(--navy)}
+.mseg:hover{outline:2px solid var(--blue);outline-offset:-2px}
+.mcat{font-size:11px;color:var(--ink-2);text-align:center;line-height:1.3;padding-bottom:8px;overflow-wrap:anywhere}
+
+.seglist{margin-top:14px;border-top:1px solid var(--rule-2)}
+.segr{display:grid;grid-template-columns:48px 1fr 92px auto;gap:10px;align-items:center;
+  padding:9px 0;border-bottom:1px solid var(--rule-2);font-size:13px}
+.segr .sd{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.segr .sm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.segr .sv{text-align:right;font-weight:600}
+.segr .sf{display:flex;gap:10px}
+@media(max-width:720px){
+  .segr{grid-template-columns:44px 1fr 82px}
+  .segr .sf{grid-column:2/-1;margin-top:2px}
+  .mchart{gap:6px}.mcol{min-width:60px}
+}
