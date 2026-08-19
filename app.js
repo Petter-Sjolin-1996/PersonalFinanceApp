@@ -1,4 +1,4 @@
-import * as C from './core.js?v=14';
+import * as C from './core.js?v=15';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -76,10 +76,16 @@ function recurring(months) {
     const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
     const rule = ann.merchantRules[e.merchant] || {};
     const auto = mean && sd / mean <= cv ? 'subscription' : 'habit';
+    // direction of travel: recent half against the earlier half
+    const half = Math.floor(months.length / 2);
+    const seq = months.map(m => e.per[m] || 0);
+    const early = seq.slice(0, half).reduce((a, b) => a + b, 0) / (half || 1);
+    const late = seq.slice(half).reduce((a, b) => a + b, 0) / (months.length - half || 1);
+    const momentum = early ? (late - early) / early * 100 : (late ? 100 : 0);
     out.push({ ...e, seen, mean, cv: mean ? sd / mean : 1,
                kind: (ann.recurring[e.merchant] || {}).kind || auto, auto,
                cancelled: (ann.recurring[e.merchant] || {}).cancelled || null,
-               last: e.per[months.at(-1)] || 0,
+               last: e.per[months.at(-1)] || 0, momentum, early, late,
                tier: rule.group ? tierOf(rule.group, rule.label) : 'Discretionary',
                cat: rule.group ? rule.group + ' / ' + rule.label : '—',
                perYear: e.total / months.length * 12 });
@@ -931,9 +937,10 @@ function drawSubs() {
   const all = recurring(months).filter(r => r.tier !== 'Must have');
   const live = all.filter(r => !r.cancelled);
   const subs = live.filter(r => r.kind === 'subscription').sort((a, b) => b.last - a.last);
-  const habits = live.filter(r => r.kind === 'habit').sort((a, b) => b.last - a.last);
+  const habits = live.filter(r => r.kind === 'habit').sort((a, b) => b.mean - a.mean);
   const gone = all.filter(r => r.cancelled).sort((a, b) => b.mean - a.mean);
-  const runRate = list => list.reduce((a, r) => a + r.last * 12, 0);
+  const basis = (r, mode) => mode === 'subscription' ? r.last : r.mean;   // habits are too lumpy for one month
+  const runRate = (list, mode) => list.reduce((a, r) => a + basis(r, mode) * 12, 0);
   const saved = gone.reduce((a, r) => a + r.mean * 12, 0);
 
   host.innerHTML = `
@@ -944,8 +951,8 @@ function drawSubs() {
     <div class="kpi">
       <div class="stat big"><b>Subscriptions, annual run rate</b><span>${krN(runRate(subs))} kr</span>
         <small>${subs.length} active · ${krN(runRate(subs) / 12)} kr in ${monthName(last)}</small></div>
-      <div class="stat"><b>Habits, annual run rate</b><span>${krN(runRate(habits))} kr</span>
-        <small>${habits.length} merchants</small></div>
+      <div class="stat"><b>Habits, annual</b><span>${krN(habits.reduce((a, r) => a + r.mean * 12, 0))} kr</span>
+        <small>${habits.length} merchants · averaged, not annualised from one month</small></div>
       <div class="stat"><b>Cancelled — saving</b><span class="good">${krN(saved)} kr</span>
         <small>${gone.length ? `${gone.length} cancelled · ${krN(saved / 12)} kr a month` : 'nothing cancelled yet'}</small></div>
     </div>
@@ -965,20 +972,30 @@ function drawSubs() {
     <p class="note">A merchant counts as recurring when it appears in at least
       ${Math.ceil(months.length * ((CONF.meta.recurring || {}).minMonthsShare ?? 0.6))} of ${months.length} months.
       Subscriptions are those whose monthly amount barely moves; the split is automatic but you can move any row.
-      A cancelled item is valued at its historical average, since ${monthName(last)} may already be zero.</p>`;
+      Subscriptions are shown at ${monthName(last)} annualised. Habits are averaged across the ${months.length} months,
+      because several bill nothing in a given month — the arrow compares the recent months against the earlier ones.
+      A cancelled item is valued at its average, since ${monthName(last)} may already be zero.</p>`;
 
   wireSubs(host, months);
 }
 
+const arrow = pct => pct > 5 ? `<i class="arw up" title="up ${Math.round(pct)}%">▲</i>`
+  : pct < -5 ? `<i class="arw dn" title="down ${Math.round(pct)}%">▼</i>`
+  : '<i class="arw fl" title="steady">–</i>';
+
 function subTable(list, last, mode) {
   if (!list.length) return '<p class="lede">None.</p>';
+  // Subscriptions bill the same amount every month, so the latest month is the
+  // truest run rate. Habits are lumpy — several bill nothing at all in a given
+  // month — so they are averaged, with an arrow for direction.
+  const avgBasis = mode !== 'subscription';
   return `<div class="tgt"><div class="sub-h">
-      <span>Merchant</span><span>Category</span><span>${monthName(last)}</span><span>Per year</span><span></span></div>
+      <span>Merchant</span><span>Category</span><span>${avgBasis ? 'Per month, avg' : monthName(last)}</span><span>Per year</span><span></span></div>
     ${list.map((r, i) => `<div class="sub-r ${mode === 'gone' ? 'off' : ''} ${mode === 'habit' ? 'tap' : ''}" data-m="${encodeURIComponent(r.merchant)}" data-i="${i}">
         <b>${r.merchant}${mode === 'habit' ? '<span class="chev">›</span>' : ''}</b>
         <span class="sc">${r.cat}<span class="tag tt${TIERS.indexOf(r.tier)}">${r.tier}</span></span>
-        <span class="v">${krN(mode === 'gone' ? r.mean : r.last)}</span>
-        <span class="v strong">${krN((mode === 'gone' ? r.mean : r.last) * 12)}</span>
+        <span class="v">${krN(avgBasis ? r.mean : r.last)}${mode === 'habit' ? ' ' + arrow(r.momentum) : ''}</span>
+        <span class="v strong">${krN((avgBasis ? r.mean : r.last) * 12)}</span>
         <span class="acts2">
           <label class="mini"><input type="checkbox" class="cx" ${r.cancelled ? 'checked' : ''}> Cancelled</label>
           ${mode !== 'gone' ? `<button class="lnk mv2">${r.kind === 'subscription' ? 'to habits' : 'to subscriptions'}</button>` : ''}
@@ -1022,9 +1039,7 @@ function historyFor(r, months) {
   const vals = months.map(m => r.per[m] || 0);
   const mx = Math.max(...vals, 1);
   const half = Math.floor(months.length / 2);
-  const early = vals.slice(0, half).reduce((a, b) => a + b, 0) / (half || 1);
-  const late = vals.slice(half).reduce((a, b) => a + b, 0) / (months.length - half || 1);
-  const pct = early ? (late - early) / early * 100 : 0;
+  const { early, late, momentum: pct } = r;
   return `<div class="histin">
     <div class="hbars">${months.map((m, i) => `<div class="hcol">
       <span class="hv">${vals[i] ? krN(vals[i]) : '–'}</span>
