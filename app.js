@@ -1,4 +1,4 @@
-import * as C from './core.js?v=7';
+import * as C from './core.js?v=8';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -83,6 +83,7 @@ const groupOf = t => ann.merchantRules[mkey(t)]?.group || 'Unknown';
 const isSpendRow = t =>
   ((t.role === 'spend' || t.role === 'fee') && t.account !== 'amex_corp') ||
   (t.role === 'p2p' && !(t.ref || '').startsWith('+46'));
+const isPersonSwish = t => roleOf(t) === 'p2p' && (t.ref || '').startsWith('+46');
 
 /** Money in and money out, per month.
 
@@ -100,14 +101,20 @@ const isSpendRow = t =>
    wallet loads and stray credits. Each carries a default, a rule by
    counterparty, and a per-transaction override. */
 const OTHER_ROLES = ['income','reimbursement','transfer_obligation','transfer_savings','wallet_load','reversal'];
-const isOther = t => OTHER_ROLES.includes(t.role) && !isSpendRow(t)
+
+/** A row can be re-pointed at a different role. Setting "Personal Swish" on the
+    two 22 July transfers moves them out of Obligations entirely and into the
+    Swish counterparty view, where they net against each other. */
+function roleOf(t) {
+  const c = (ann.txOverrides[t.fp] || {}).counts || (ann.transferRules[otherKeyRaw(t)] || {}).counts;
+  return c === 'p2p' ? 'p2p' : t.role;
+}
+const otherKeyRaw = t => t.role === 'income' ? 'Salary'
+  : t.role === 'reimbursement' ? 'McKinsey reimbursements' : (t.ref || t.desc);
+const isOther = t => OTHER_ROLES.includes(t.role) && roleOf(t) !== 'p2p' && !isSpendRow(t)
   && !(t.role === 'reversal' && t.account.startsWith('amex'));
 
-function otherKey(t) {
-  if (t.role === 'income') return 'Salary';
-  if (t.role === 'reimbursement') return 'McKinsey reimbursements';
-  return t.ref || t.desc;
-}
+const otherKey = otherKeyRaw;
 const DEFAULT_COUNTS = { income: 'income', reimbursement: 'ignore', transfer_obligation: 'expenditure',
   transfer_savings: 'savings', wallet_load: 'ignore', reversal: 'ignore' };
 
@@ -118,8 +125,8 @@ function flowOf(t) {
   const r = ann.transferRules[otherKey(t)] || {};
   return {
     counts: o.counts || r.counts || DEFAULT_COUNTS[t.role] || 'ignore',
-    group: o.group ?? r.group ?? null,
-    label: o.label ?? r.label ?? null,
+    group: ('group' in o) ? o.group : (r.group ?? null),
+    label: ('label' in o) ? o.label : (r.label ?? null),
   };
 }
 
@@ -138,7 +145,7 @@ function cashByMonth(months) {
     if (skip.has(t.ref)) continue;
     if (adjust && ann.oneOffs[t.fp]) continue;
     if (isSpendRow(t)) { if (!ann.workExpenses[t.fp]) out[m].spend += Math.abs(t.amount); }
-    else if (t.role === 'p2p') out[m].spend -= t.amount;      // net: sent adds, received subtracts
+    else if (isPersonSwish(t)) out[m].spend -= t.amount;      // net: sent adds, received subtracts
     else if (isOther(t)) {
       const f = flowOf(t);
       if (f.counts === 'income') out[m].income += Math.abs(t.amount);
@@ -166,8 +173,7 @@ const corpUnreviewed = () => {
   const through = ann.corpReviewedThrough || '0000-00-00';
   return corpRows().filter(t => t.date > through).length;
 };
-const swishRefs = () => [...new Set(ledger.transactions
-  .filter(t => t.role === 'p2p' && (t.ref || '').startsWith('+46')).map(t => t.ref))];
+const swishRefs = () => [...new Set(ledger.transactions.filter(isPersonSwish).map(t => t.ref))];
 const swishUnnamed = () => swishRefs().filter(r => !ann.swishNames[r]).length;
 const otherGroups = () => {
   const g = new Map();
@@ -372,7 +378,7 @@ function breakdown(months) {
       if (f.counts !== 'expenditure') continue;
       const who = accByRef[t.ref] || ann.swishNames[t.ref] || otherKey(t);
       put(f.group || 'Uncategorised transfers', f.label || who, m, -t.amount);
-    } else if (t.role === 'p2p') {
+    } else if (isPersonSwish(t)) {
       put('Swish (net)', ann.swishNames[t.ref] || t.ref, m, -t.amount);
     }
   }
@@ -772,7 +778,7 @@ function renderCorp() {
 /* ------------------------------------------------------------- swish ----- */
 function renderSwish() {
   if (!ledger) return;
-  const rows = ledger.transactions.filter(t => t.role === 'p2p' && (t.ref || '').startsWith('+46'));
+  const rows = ledger.transactions.filter(isPersonSwish);
   const by = new Map();
   for (const t of rows) {
     const e = by.get(t.ref) || { ref: t.ref, n: 0, sent: 0, recv: 0, net: 0 };
@@ -820,7 +826,8 @@ function renderSwish() {
 
 
 /* ------------------------------------------------- transfers & income --- */
-const COUNTS = [['expenditure','Expenditure'],['income','Income'],['savings','Savings'],['ignore','Ignore']];
+const COUNTS = [['expenditure','Expenditure'],['income','Income'],['savings','Savings'],
+                ['p2p','Personal Swish'],['ignore','Ignore']];
 
 function renderOther() {
   if (!ledger) return;
@@ -856,11 +863,16 @@ function renderOther() {
       <div class="tx">${g.tx.slice().sort((a,b) => a.date < b.date ? 1 : -1).map(t => {
         const o = ann.txOverrides[t.fp] || {};
         const out = Math.abs(t.amount), flag = band && t.amount < 0 && (out < band[0] || out > band[1]);
+        const oc = o.counts || eff;
         return `<div class="tx-r" data-fp="${t.fp}">
           <span class="when">${t.date}${flag ? ' <span class="tag rev">outside band</span>' : ''}</span>
           <span class="num">${kr(t.amount)}</span>
           <select class="ovr"><option value="">follow rule</option>
             ${COUNTS.map(([v,l]) => `<option value="${v}"${o.counts === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
+          <select class="ovrcat" ${oc === 'expenditure' ? '' : 'disabled'}>
+            <option value="">follow rule</option>
+            ${('group' in o) ? optionsFor(cat(o)).replace('<option value="">— pick a category —</option>','') : optionsFor('').replace('<option value="">— pick a category —</option>','')}
+          </select>
         </div>`;
       }).join('')}</div></article>`);
 
@@ -882,7 +894,14 @@ function renderOther() {
     card.querySelectorAll('.ovr').forEach(sel => sel.onchange = ev => {
       const fp = ev.target.closest('.tx-r').dataset.fp;
       if (ev.target.value) (ann.txOverrides[fp] ||= {}).counts = ev.target.value;
-      else delete ann.txOverrides[fp];
+      else { const o = ann.txOverrides[fp]; if (o) { delete o.counts; if (!Object.keys(o).length) delete ann.txOverrides[fp]; } }
+      markDirty(); renderOther(); refreshBadges();
+    });
+    card.querySelectorAll('.ovrcat').forEach(sel => sel.onchange = ev => {
+      const fp = ev.target.closest('.tx-r').dataset.fp;
+      const o = ann.txOverrides[fp] ||= {};
+      if (ev.target.value) { const [gr, l] = ev.target.value.split(' / '); o.group = gr; o.label = l; }
+      else { delete o.group; delete o.label; if (!Object.keys(o).length) delete ann.txOverrides[fp]; }
       markDirty();
     });
     list.appendChild(card);
