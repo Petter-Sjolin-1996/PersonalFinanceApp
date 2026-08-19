@@ -263,7 +263,8 @@ function drawControl() {
         <div class="fpair">
           <div class="fbw"><span class="fnum">${krN(c.income)}</span>
             <div class="fb in" style="height:${c.income / scale * 100}%"></div></div>
-          <div class="fbw"><span class="fnum">${krN(c.spend)}</span>
+          <div class="fbw tapme" data-m="${m}" role="button" tabindex="0"
+               aria-label="Breakdown for ${monthName(m)}"><span class="fnum">${krN(c.spend)}</span>
             <div class="fb out" style="height:${c.spend / scale * 100}%"></div></div>
         </div>
         <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`;
@@ -296,6 +297,116 @@ function drawControl() {
       — ${all.length} of 12 months elapsed.</p>`;
 
   $('adj').onchange = e => { adjust = e.target.checked; drawControl(); };
+  host.querySelectorAll('.fbw.tapme').forEach(b => {
+    b.onclick = () => openMonth(b.dataset.m, months);
+    b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openMonth(b.dataset.m, months); } };
+  });
+}
+
+/* ------------------------------------------------- month drill-down ------ */
+/** Obligations and net Swish are shown as categories of their own. They carry
+    no merchant rule, but without them the rows would not add up to the bar
+    that was tapped — and both are large movers. */
+function breakdown(months) {
+  const skip = excludedRefs();
+  const accByRef = Object.fromEntries((CONF.accounts || []).filter(a => a.match?.ref).map(a => [a.match.ref, a.label]));
+  const cats = {};                                   // cat -> { byMonth, subs: sub -> byMonth }
+  const put = (cat, sub, m, v) => {
+    const c = cats[cat] ||= { byMonth: {}, subs: {} };
+    c.byMonth[m] = (c.byMonth[m] || 0) + v;
+    (c.subs[sub] ||= {})[m] = (c.subs[sub][m] || 0) + v;
+  };
+  for (const t of ledger.transactions) {
+    const m = t.date.slice(0, 7);
+    if (!months.includes(m) || skip.has(t.ref)) continue;
+    if (adjust && ann.oneOffs[t.fp]) continue;
+    if (isSpendRow(t)) {
+      if (ann.workExpenses[t.fp]) continue;
+      const r = ann.merchantRules[mkey(t)];
+      put(r?.group || 'Unknown', r?.label || 'Unlabelled', m, Math.abs(t.amount));
+    } else if (t.role === 'transfer_obligation') {
+      const who = t.ref === CONF.meta.dadSwish ? 'Dad — mortgage'
+                : accByRef[t.ref] || ann.swishNames[t.ref] || t.ref || 'Other';
+      put('Obligations', who, m, Math.abs(t.amount));
+    } else if (t.role === 'p2p') {
+      put('Swish (net)', ann.swishNames[t.ref] || t.ref, m, -t.amount);
+    }
+  }
+  return cats;
+}
+
+function openMonth(m, months) {
+  $('monthModal')?.remove();
+  const cats = breakdown(months);
+  const rows = Object.entries(cats).map(([cat, c]) => {
+    const now = c.byMonth[m] || 0;
+    const avg = months.reduce((a, x) => a + (c.byMonth[x] || 0), 0) / months.length;
+    const subs = Object.entries(c.subs)
+      .map(([label, by]) => ({ label, now: by[m] || 0,
+                               avg: months.reduce((a, x) => a + (by[x] || 0), 0) / months.length }))
+      .filter(s => s.now || s.avg)
+      .sort((a, b) => b.now - a.now);
+    return { cat, now, avg, delta: now - avg, subs };
+  }).filter(r => r.now || r.avg).sort((a, b) => b.now - a.now);
+
+  const total = rows.reduce((a, r) => a + r.now, 0);
+  const totAvg = rows.reduce((a, r) => a + r.avg, 0);
+  const gap = total - totAvg;
+  const movers = rows.slice().sort((a, b) => b.delta - a.delta);
+  const up = movers.filter(r => r.delta > 0).slice(0, 3);
+  const down = movers.filter(r => r.delta < 0).slice(-2).reverse();
+  const scale = Math.max(...rows.flatMap(r => [r.now, r.avg]), 1);
+
+  const modal = el(`<div class="modal" id="monthModal"><div class="sheet wide drill">
+    <div class="dhead">
+      <div><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2>
+        <p class="dsum">Expenditure <b>${krN(total)} kr</b> ·
+          <span class="${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr</span>
+          against the ${months.length}-month average of ${krN(totAvg)} kr</p></div>
+      <button class="xclose" aria-label="Close">&times;</button>
+    </div>
+
+    ${up.length ? `<div class="movers"><b>Biggest movers</b>
+      ${up.map(r => `<span class="mv up">${r.cat} +${krN(r.delta)}</span>`).join('')}
+      ${down.map(r => `<span class="mv dn">${r.cat} −${krN(Math.abs(r.delta))}</span>`).join('')}</div>` : ''}
+
+    <div class="legend"><span><i class="sw-in"></i>This month</span><span><i class="sw-out"></i>${months.length}-month average</span></div>
+    <div class="dchart">${rows.map(r => `<div class="dcol">
+      <span class="fnum">${krN(r.now)}</span>
+      <div class="dbars">
+        <div class="fb in" style="height:${Math.max(r.now / scale * 100, 0)}%"></div>
+        <div class="fb out" style="height:${Math.max(r.avg / scale * 100, 0)}%"></div>
+      </div>
+      <span class="dlab">${r.cat}</span></div>`).join('')}</div>
+
+    <div class="dlist">
+      <div class="dl-h"><span>Category</span><span>This month</span><span>Average</span><span>Difference</span></div>
+      ${rows.map((r, i) => `<div class="dl-r" data-i="${i}" role="button" tabindex="0">
+          <b>${r.cat}<span class="chev">›</span></b>
+          <span class="v">${krN(r.now)}</span><span class="v">${krN(r.avg)}</span>
+          <span class="v ${r.delta > 0 ? 'over' : 'under'}">${r.delta > 0 ? '+' : '−'}${krN(Math.abs(r.delta))}</span>
+        </div>
+        <div class="dl-sub" data-sub="${i}" hidden>${r.subs.map(s => `<div class="dl-s">
+          <span>${s.label}</span><span class="v">${krN(s.now)}</span><span class="v muted">${krN(s.avg)}</span>
+          <span class="v ${s.now - s.avg > 0 ? 'over' : 'under'}">${s.now - s.avg > 0 ? '+' : '−'}${krN(Math.abs(s.now - s.avg))}</span>
+        </div>`).join('') || '<div class="dl-s"><span>No detail</span></div>'}</div>`).join('')}
+    </div>
+    <p class="note">The average includes this month. Tap any category for its labels.
+      Obligations and net Swish appear as categories so the rows add up to the bar you tapped.</p>
+  </div></div>`);
+
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector('.xclose').onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+  modal.querySelectorAll('.dl-r').forEach(r => {
+    const toggle = () => {
+      const sub = modal.querySelector(`[data-sub="${r.dataset.i}"]`);
+      sub.hidden = !sub.hidden; r.classList.toggle('open', !sub.hidden);
+    };
+    r.onclick = toggle;
+    r.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
+  });
 }
 
 function drawTargets() {
