@@ -1,4 +1,4 @@
-import * as C from './core.js?v=24';
+import * as C from './core.js?v=25';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -478,9 +478,9 @@ function drawControl() {
 
   $('adj').onchange = e => { adjust = e.target.checked; drawControl(); };
   host.querySelectorAll('.fbw.tapme').forEach(b => {
-    const goMonth = () => { monthCursor = complete().indexOf(b.dataset.m); go('control', 'month'); };
-    b.onclick = goMonth;
-    b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goMonth(); } };
+    const open = () => openMonth(b.dataset.m, months);
+    b.onclick = open;
+    b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
   });
 }
 
@@ -559,6 +559,94 @@ function lighten(hex, t) {
   return `rgb(${m(r)},${m(g)},${m(b)})`;
 }
 
+
+/** Opened from an expenditure bar on the overview. Reads from breakdown(),
+    which sits on expenditureItems(), so it can never disagree with the
+    deep-dive or the sections underneath. */
+function openMonth(m, months) {
+  document.getElementById('monthModal')?.remove();
+  const cats = breakdown(months);
+  const rows = Object.entries(cats).map(([cat, c]) => {
+    const now = c.byMonth[m] || 0;
+    const avg = months.reduce((a, x) => a + (c.byMonth[x] || 0), 0) / months.length;
+    const subs = Object.entries(c.subs)
+      .map(([label, by]) => ({ label, now: by[m] || 0,
+                               avg: months.reduce((a, x) => a + (by[x] || 0), 0) / months.length }))
+      .filter(x => x.now || x.avg).sort((a, b) => b.now - a.now);
+    return { cat, now, avg, delta: now - avg, subs };
+  }).filter(r => r.now || r.avg).sort((a, b) => b.now - a.now);
+
+  const total = rows.reduce((a, r) => a + r.now, 0);
+  const totAvg = rows.reduce((a, r) => a + r.avg, 0);
+  const gap = total - totAvg;
+
+  const maxPos = Math.max(...rows.flatMap(r => [r.now, r.avg, 0]));
+  const maxNeg = Math.abs(Math.min(...rows.flatMap(r => [r.now, r.avg, 0])));
+  const span = maxPos + maxNeg || 1;
+  const zero = maxNeg / span * 100;
+  const seg = v => v >= 0 ? { left: zero, width: v / span * 100 }
+                          : { left: zero - Math.abs(v) / span * 100, width: Math.abs(v) / span * 100 };
+  const tick = v => zero + v / span * 100;
+  const headScale = Math.max(total, totAvg, 1);
+  const bar = (v, cls) => `<div class="hbar"><i class="${cls}" style="width:${v / headScale * 100}%"></i></div>`;
+
+  const modal = el(`<div class="modal" id="monthModal"><div class="sheet wide drill">
+    <div class="dhead">
+      <div><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2></div>
+      <button class="xclose" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="hcompare">
+      <div class="hrow"><span class="hlab">This month</span>${bar(total, 'in')}<span class="hval">${krN(total)} kr</span></div>
+      <div class="hrow"><span class="hlab">${months.length}-month average</span>${bar(totAvg, 'out')}<span class="hval muted">${krN(totAvg)} kr</span></div>
+      <div class="hdelta ${gap > 0 ? 'up' : 'dn'}">${gap > 0 ? '+' : '−'}${krN(Math.abs(gap))} kr ${gap > 0 ? 'above' : 'below'} average</div>
+    </div>
+
+    <div class="dlist">
+      <div class="dl-h"><span>Category</span><span class="hcol">This month against average</span>
+        <span>This month</span><span>Average</span><span>Difference</span></div>
+      ${rows.map((r, i) => {
+        const b = seg(r.now);
+        return `<div class="dl-r" data-i="${i}" role="button" tabindex="0">
+          <b>${r.cat}<span class="chev">›</span></b>
+          <div class="cbar"><u class="zero" style="left:${zero}%"></u>
+            <i class="${r.now < 0 ? 'neg' : ''}" style="left:${b.left}%;width:${b.width}%"></i>
+            <u class="avg" style="left:${tick(r.avg)}%"></u></div>
+          <span class="v">${krN(r.now)}</span><span class="v muted">${krN(r.avg)}</span>
+          <span class="v ${r.delta > 0 ? 'over' : 'under'}">${r.delta > 0 ? '+' : '−'}${krN(Math.abs(r.delta))}</span>
+        </div>
+        <div class="dl-sub" data-sub="${i}" hidden>${r.subs.map(x => `<div class="dl-s">
+          <span>${x.label}</span>
+          <div class="cbar sub"><u class="zero" style="left:${zero}%"></u>
+            <i class="${x.now < 0 ? 'neg' : ''}" style="left:${seg(x.now).left}%;width:${seg(x.now).width}%"></i>
+            <u class="avg" style="left:${tick(x.avg)}%"></u></div>
+          <span class="v">${krN(x.now)}</span><span class="v muted">${krN(x.avg)}</span>
+          <span class="v ${x.now - x.avg > 0 ? 'over' : 'under'}">${x.now - x.avg > 0 ? '+' : '−'}${krN(Math.abs(x.now - x.avg))}</span>
+        </div>`).join('') || '<div class="dl-s"><span>No detail</span></div>'}</div>`;
+      }).join('')}
+    </div>
+    <div class="sheet-act"><button class="btn" id="mmDeep">Open the full month</button>
+      <button class="btn pri" id="mmClose">Done</button></div>
+    <p class="note">The grey tick on each bar marks the ${months.length}-month average, which includes this month.
+      Tap any category for its labels.</p>
+  </div></div>`);
+
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector('.xclose').onclick = close;
+  modal.querySelector('#mmClose').onclick = close;
+  modal.querySelector('#mmDeep').onclick = () => { close(); monthCursor = complete().indexOf(m); go('control', 'month'); };
+  modal.onclick = e => { if (e.target === modal) close(); };
+  modal.querySelectorAll('.dl-r').forEach(r => {
+    const toggle = () => {
+      const sub = modal.querySelector(`[data-sub="${r.dataset.i}"]`);
+      sub.hidden = !sub.hidden; r.classList.toggle('open', !sub.hidden);
+    };
+    r.onclick = toggle;
+    r.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
+  });
+}
+
 /* ==================================================== MONTH DEEP-DIVE ==== */
 function drawMonth() {
   const all = complete();
@@ -592,9 +680,7 @@ function drawMonth() {
   host.innerHTML = `
     <div class="mnav">
       <button class="narw" id="mPrev" ${monthCursor === 0 ? 'disabled' : ''} aria-label="Previous month">‹</button>
-      <div class="mnow"><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2>
-        <span>${krN(total)} kr · ${total > totalAvg ? '+' : '−'}${krN(Math.abs(total - totalAvg))} kr against the
-        ${window12.length}-month average</span></div>
+      <div class="mnow"><h2>${new Date(m + '-01').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2></div>
       <button class="narw" id="mNext" ${monthCursor === all.length - 1 ? 'disabled' : ''} aria-label="Next month">›</button>
     </div>
 
