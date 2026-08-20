@@ -1,4 +1,4 @@
-import * as C from './core.js?v=27';
+import * as C from './core.js?v=28';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -1827,17 +1827,19 @@ addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.retur
 
 /* ---------------------------------------------------------------- boot --- */
 function boot() {
+  window.__booted = true;                    // tells the watchdog in index.html we are alive
   $('confBtn').hidden = false;
   go(unconfirmed() ? 'categorise' : 'control');
 }
 
 (async function init() {
+  window.__booted = true;
   try { cfg = JSON.parse(localStorage.getItem(CFG_KEY) || 'null'); } catch { cfg = null; }
   if (!cfg) {
     banner('Not connected yet. Open <b>Settings</b> and enter your GitHub username, the data repository name, and your access token.');
     setSync('err', 'not set up');
     return;
   }
-  try { await connect(); boot(); if (staleWarning) banner(staleWarning); }
+   try { await connect(); boot(); if (staleWarning) banner(staleWarning); }
   catch (e) { setSync('err', 'error'); banner(e.message + ' — open Settings to check your details.'); }
 })();
