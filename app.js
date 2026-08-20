@@ -1,4 +1,4 @@
-import * as C from './core.js?v=29';
+import * as C from './core.js?v=30';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -821,25 +821,6 @@ const targetKeys = () => {
     .flatMap(g => [g, ...CONF.categories.filter(c => c.group === g).map(c => g + ' / ' + c.label)]);
   return [...out, 'Swish (net)'];
 };
-
-/** Grouped picker: the flat list mixed groups and labels and read as noise.
-    Each group becomes a heading, with "All of …" first and its labels under it. */
-function targetOptions(taken) {
-  const groups = [...new Set(CONF.categories.map(c => c.group))].sort();
-  let h = '<option value="">Choose a category or label…</option>';
-  for (const g of groups) {
-    const labels = CONF.categories.filter(c => c.group === g).map(c => g + ' / ' + c.label);
-    const free = [g, ...labels].filter(k => !taken[k]);
-    if (!free.length) continue;
-    h += `<optgroup label="${g}">`;
-    if (!taken[g]) h += `<option value="${g}">All of ${g}</option>`;
-    for (const k of labels) if (!taken[k]) h += `<option value="${k}">${k.split(' / ')[1]}</option>`;
-    h += '</optgroup>';
-  }
-  if (!taken['Swish (net)'])
-    h += '<optgroup label="Other"><option value="Swish (net)">Swish (net)</option></optgroup>';
-  return h;
-}
 
 /** History for whatever is highlighted in the picker — you cannot set a
     sensible monthly figure without seeing what the last year actually looked
