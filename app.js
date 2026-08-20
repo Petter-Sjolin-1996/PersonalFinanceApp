@@ -1,4 +1,4 @@
-import * as C from './core.js?v=26';
+import * as C from './core.js?v=27';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -821,6 +821,68 @@ const targetKeys = () => {
     .flatMap(g => [g, ...CONF.categories.filter(c => c.group === g).map(c => g + ' / ' + c.label)]);
   return [...out, 'Swish (net)'];
 };
+
+/** Grouped picker: the flat list mixed groups and labels and read as noise.
+    Each group becomes a heading, with "All of …" first and its labels under it. */
+function targetOptions(taken) {
+  const groups = [...new Set(CONF.categories.map(c => c.group))].sort();
+  let h = '<option value="">Choose a category or label…</option>';
+  for (const g of groups) {
+    const labels = CONF.categories.filter(c => c.group === g).map(c => g + ' / ' + c.label);
+    const free = [g, ...labels].filter(k => !taken[k]);
+    if (!free.length) continue;
+    h += `<optgroup label="${g}">`;
+    if (!taken[g]) h += `<option value="${g}">All of ${g}</option>`;
+    for (const k of labels) if (!taken[k]) h += `<option value="${k}">${k.split(' / ')[1]}</option>`;
+    h += '</optgroup>';
+  }
+  if (!taken['Swish (net)'])
+    h += '<optgroup label="Other"><option value="Swish (net)">Swish (net)</option></optgroup>';
+  return h;
+}
+
+/** History for whatever is highlighted in the picker — you cannot set a
+    sensible monthly figure without seeing what the last year actually looked
+    like. Clears once the target is added. */
+function targetPreview(key) {
+  const months = complete().slice(-12);
+  const items = expenditureItems(months);
+  const vals = months.map(m => items.filter(i => i.m === m && matchesKey(i, key)).reduce((a, i) => a + i.v, 0));
+  const avg = vals.reduce((a, b) => a + b, 0) / (vals.length || 1);
+  const mx = Math.max(...vals, 1);
+  const sorted = [...vals].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] || 0;
+  return { avg, median, min: Math.min(...vals), max: mx, html: `
+    <div class="preview">
+      <div class="pvHead"><b>${key}</b>
+        <span>average <em>${krN(avg)}</em> · typical <em>${krN(median)}</em> ·
+          range ${krN(Math.min(...vals))}–${krN(mx)}</span></div>
+      <div class="hbars">${months.map((m, i) => `<div class="hcol">
+        <span class="hv">${vals[i] ? krN(vals[i]) : '–'}</span>
+        <div class="hb" style="height:${vals[i] / mx * 78}px"></div>
+        <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`).join('')}</div>
+      <p class="note">A target below the typical month asks for a change of habit;
+        one above it will simply always be met.</p>
+    </div>` };
+}
+/** Grouped so the picker reads as a structure rather than a wall of
+    "Group / Label" strings — the same shape as the merchant category picker. */
+function targetOptions() {
+  const taken = CONF.targets?.monthly || {};
+  let h = '<option value="">Choose a category or label…</option>';
+  for (const [g, list] of groups()) {
+    const opts = [];
+    if (!taken[g]) opts.push(`<option value="${g}">All of ${g}</option>`);
+    for (const c of list) {
+      const k = g + ' / ' + c.label;
+      if (!taken[k]) opts.push(`<option value="${k}">${c.label}</option>`);
+    }
+    if (opts.length) h += `<optgroup label="${g}">${opts.join('')}</optgroup>`;
+  }
+  if (!taken['Swish (net)']) h += `<optgroup label="Other"><option value="Swish (net)">Swish (net)</option></optgroup>`;
+  return h;
+}
+
 const matchesKey = (it, key) => key.includes(' / ')
   ? it.group + ' / ' + it.label === key : it.group === key;
 
@@ -921,12 +983,11 @@ function drawTargets() {
         : '<div class="tgt-r2"><b class="muted">No targets yet.</b></div>'}
     </div>
     <div class="addrow">
-      <select id="newTargetKey"><option value="">Choose a category or label…</option>
-        ${targetKeys().filter(k => !(CONF.targets.monthly || {})[k])
-          .map(k => `<option value="${k}">${k}</option>`).join('')}</select>
+      <select id="newTargetKey">${targetOptions()}</select>
       <input id="newTargetVal" inputmode="numeric" placeholder="kr per month" style="max-width:150px">
       <button class="btn pri" id="addTarget">Add target</button>
-    </div>`;
+    </div>
+    <div id="targetPreview"></div>`;
 
   host.querySelectorAll('.tgt-r2').forEach(r => {
     const key = decodeURIComponent(r.dataset.k || '');
@@ -939,6 +1000,35 @@ function drawTargets() {
       delete CONF.targets.monthly[key]; confDirty = true; markDirty(); drawTargets();
     });
   });
+  const preview = () => {
+    const box = $('targetPreview'), key = $('newTargetKey').value;
+    if (!key) { box.innerHTML = ''; return; }
+    const items = expenditureItems(months);
+    const vals = months.map(m => items.filter(i => i.m === m && matchesKey(i, key)).reduce((a, i) => a + i.v, 0));
+    const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const mx = Math.max(...vals, 1);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    box.innerHTML = `<div class="prev">
+      <div class="prevHead"><b>${key}</b>
+        <span>average <em>${krN(avg)} kr</em> · range ${krN(lo)}–${krN(hi)} kr over ${months.length} months</span></div>
+      <div class="prevBars">${months.map((m, i) => `<div class="pcol">
+        <span class="pv">${vals[i] ? krN(vals[i]) : '–'}</span>
+        <div class="pb" style="height:${vals[i] / mx * 78}px"></div>
+        <span class="tlab">${monthName(m).slice(0, 3)}</span></div>`).join('')}
+        <div class="pavg" style="bottom:${22 + avg / mx * 78}px"></div></div>
+      <p class="note">Set the target against this, not against a guess. The line marks the average.</p>
+    </div>`;
+    if (!$('newTargetVal').value) $('newTargetVal').value = Math.round(avg / 100) * 100;
+  };
+  $('newTargetKey').onchange = () => { $('newTargetVal').value = ''; preview(); };
+
+  $('newTargetKey').onchange = e => {
+    const k = e.target.value;
+    if (!k) { $('targetPreview').innerHTML = ''; $('newTargetVal').value = ''; return; }
+    const p = targetPreview(k);
+    $('targetPreview').innerHTML = p.html;
+    $('newTargetVal').value = Math.round(p.median / 100) * 100 || Math.round(p.avg / 100) * 100;
+  };
   $('addTarget').onclick = () => {
     const k = $('newTargetKey').value;
     const v = parseFloat($('newTargetVal').value.replace(/\s/g, ''));
