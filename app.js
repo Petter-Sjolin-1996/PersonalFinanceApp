@@ -1,4 +1,4 @@
-import * as C from './core.js?v=28';
+import * as C from './core.js?v=29';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -1840,6 +1840,6 @@ function boot() {
     setSync('err', 'not set up');
     return;
   }
-   try { await connect(); boot(); if (staleWarning) banner(staleWarning); }
+  try { await connect(); boot(); if (staleWarning) banner(staleWarning); }
   catch (e) { setSync('err', 'error'); banner(e.message + ' — open Settings to check your details.'); }
 })();
