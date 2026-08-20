@@ -1,4 +1,4 @@
-import * as C from './core.js?v=25';
+import * as C from './core.js?v=26';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -18,7 +18,7 @@ const FALLBACK_CATS = [
 const CFG_KEY = 'ledger.cfg';
 const SEEN_KEY = 'ledger.lastSaved';   // stamp of the newest annotations this device wrote
 const SECTIONS = {
-  control:      [['overview','Overview'], ['month','Month deep-dive'], ['subs','Subscriptions']],
+  control:      [['overview','Overview'], ['month','Month deep-dive'], ['subs','Subscriptions'], ['targets','Targets']],
   transactions: [['import','Upload transactions'], ['coverage','Data coverage']],
   categorise:   [['expenses','Expense categorisation'], ['corp','Corporate allocation'],
                  ['swish','Swish counterparties'], ['other','Transfers & income']],
@@ -353,7 +353,7 @@ function go(sec, p) {
   $('subnav').hidden = panes.length < 2;
 
   const show = {
-    overview: 'viewControl', month: 'viewMonth', subs: 'viewSubs', import: 'viewImport', coverage: 'viewCoverage',
+    overview: 'viewControl', month: 'viewMonth', subs: 'viewSubs', targets: 'viewTargets', import: 'viewImport', coverage: 'viewCoverage',
     expenses: 'viewExpenses', corp: 'viewCorp', swish: 'viewSwish', other: 'viewOther',
   };
   for (const v of Object.values(show)) $(v).hidden = true;
@@ -364,7 +364,7 @@ function go(sec, p) {
   const n = unconfirmed() + corpUnreviewed() + swishUnnamed() + otherUnruled();
   $('navBadge').textContent = n; $('navBadge').hidden = !n;
 
-  ({ overview: drawControl, month: drawMonth, subs: drawSubs, import: drawImport, coverage: drawCoverage,
+  ({ overview: drawControl, month: drawMonth, subs: drawSubs, targets: drawTargets, import: drawImport, coverage: drawCoverage,
      expenses: render, corp: renderCorp, swish: renderSwish, other: renderOther })[pane]();
 }
 document.querySelectorAll('#nav button').forEach(b => b.onclick = () => go(b.dataset.s));
@@ -810,6 +810,143 @@ function openSeg(m, group, label) {
     r.group = g || null; r.label = l || null; r.confirmed = true;
     markDirty(); toast('Recategorised — applies to every transaction from this merchant');
   });
+}
+
+
+/* ========================================================== TARGETS ====== */
+/** A target key is either a group ("Food & Drinks") or a single label
+    ("Food & Drinks / Alcohol"). Groups aggregate their labels. */
+const targetKeys = () => {
+  const out = [...new Set(CONF.categories.map(c => c.group))].sort()
+    .flatMap(g => [g, ...CONF.categories.filter(c => c.group === g).map(c => g + ' / ' + c.label)]);
+  return [...out, 'Swish (net)'];
+};
+const matchesKey = (it, key) => key.includes(' / ')
+  ? it.group + ' / ' + it.label === key : it.group === key;
+
+/** Month-by-month scoring for the headline rule and every label target.
+    Everything is retrospective: this is a scorecard for closed months, not a
+    gauge for a month in progress. */
+function scoreMonths() {
+  const months = complete().slice(-12);
+  const items = expenditureItems(months);
+  const cash = cashByMonth(months);
+  const T = CONF.targets ||= {}; T.monthly ||= {};
+  const rows = [];
+
+  const disc = {}, sav = {};
+  for (const m of months) {
+    disc[m] = items.filter(i => i.m === m && i.tier === 'Discretionary').reduce((a, i) => a + i.v, 0);
+    sav[m] = cash[m].net;
+  }
+  if (T.discretionaryUnderSavings !== false) rows.push({
+    key: '__rule', name: 'Discretionary below what you saved', kind: 'rule',
+    cells: months.map(m => ({ m, value: disc[m], limit: sav[m], hit: disc[m] < sav[m] })),
+  });
+
+  for (const [key, limit] of Object.entries(T.monthly)) {
+    rows.push({
+      key, name: key, kind: 'label', limit,
+      cells: months.map(m => {
+        const v = items.filter(i => i.m === m && matchesKey(i, key)).reduce((a, i) => a + i.v, 0);
+        return { m, value: v, limit, hit: v <= limit };
+      }),
+    });
+  }
+  return { months, rows };
+}
+
+const streakOf = cells => {
+  let n = 0;
+  for (let i = cells.length - 1; i >= 0 && cells[i].hit; i--) n++;
+  return n;
+};
+
+function drawTargets() {
+  const { months, rows } = scoreMonths();
+  const host = $('viewTargets');
+  if (!months.length) { host.innerHTML = '<div class="empty"><h3>No complete months yet</h3></div>'; return; }
+  const last = months.at(-1);
+  const rule = rows.find(r => r.key === '__rule');
+  const labels = rows.filter(r => r.kind === 'label');
+  const hits = r => r.cells.filter(c => c.hit).length;
+  const saved = labels.reduce((a, r) => a + r.cells.reduce((x, c) => x + Math.max(0, c.limit - c.value), 0), 0);
+  const over = labels.reduce((a, r) => a + r.cells.reduce((x, c) => x + Math.max(0, c.value - c.limit), 0), 0);
+
+  host.innerHTML = `
+    ${rule ? (() => {
+      const c = rule.cells.at(-1);
+      return `<div class="ruleCard ${c.hit ? 'hit' : 'miss'}">
+        <div class="rcMain"><b>Discretionary below what you saved</b>
+          <span class="rcVerdict">${monthName(last)} — ${c.hit ? 'met' : 'missed'} by ${krN(Math.abs(c.limit - c.value))} kr</span></div>
+        <div class="rcNums">
+          <span><em>${krN(c.value)}</em>discretionary</span>
+          <span><em>${krN(c.limit)}</em>saved</span>
+          <span><em>${hits(rule)}/${months.length}</em>months met</span>
+        </div></div>`;
+    })() : ''}
+
+    <h3 class="sh">Scorecard</h3>
+    <div class="score" style="--mn:${months.length}">
+      <div class="scHead"><span></span>${months.map(m =>
+        `<span>${monthName(m).slice(0, 1)}</span>`).join('')}<span class="scSum">Met</span><span class="scSum">Streak</span></div>
+      ${rows.map(r => `<div class="scRow">
+        <span class="scName">${r.name}${r.kind === 'label'
+          ? `<em>${krN(r.limit)} kr</em>` : ''}</span>
+        ${r.cells.map(c => `<span class="dot ${c.hit ? 'on' : 'off'}"
+          title="${monthName(c.m)} — ${krN(c.value)} against ${krN(c.limit)}"></span>`).join('')}
+        <span class="scSum">${hits(r)}/${months.length}</span>
+        <span class="scSum ${streakOf(r.cells) ? 'good' : ''}">${streakOf(r.cells)}</span>
+      </div>`).join('')}
+    </div>
+    <p class="note">One square per complete month, oldest first. Filled means the target was met.
+      Hover or tap a square for the figures.</p>
+
+    ${labels.length ? `<div class="kpi" style="margin-top:22px">
+      <div class="stat big"><b>Under target, cumulative</b><span class="good">${krN(saved)} kr</span>
+        <small>across ${labels.length} target${labels.length > 1 ? 's' : ''} and ${months.length} months</small></div>
+      <div class="stat"><b>Over target, cumulative</b><span>${krN(over)} kr</span>
+        <small>net ${saved - over >= 0 ? '+' : '−'}${krN(Math.abs(saved - over))} kr</small></div>
+    </div>` : ''}
+
+    <h3 class="sh">Your targets</h3>
+    <p class="lede">Pick any category or label and set what you want to spend on it each month.
+      Steady things make good targets; something that swings between nothing and ten thousand does not.</p>
+    <div class="tgt">
+      ${labels.length ? labels.map(r => `<div class="tgt-r2" data-k="${encodeURIComponent(r.key)}">
+        <b>${r.name}</b>
+        <span class="v muted">${krN(r.cells.reduce((a, c) => a + c.value, 0) / months.length)} avg</span>
+        <span class="tgtin"><input inputmode="numeric" value="${r.limit}"></span>
+        <button class="cdel" title="Remove">&times;</button></div>`).join('')
+        : '<div class="tgt-r2"><b class="muted">No targets yet.</b></div>'}
+    </div>
+    <div class="addrow">
+      <select id="newTargetKey"><option value="">Choose a category or label…</option>
+        ${targetKeys().filter(k => !(CONF.targets.monthly || {})[k])
+          .map(k => `<option value="${k}">${k}</option>`).join('')}</select>
+      <input id="newTargetVal" inputmode="numeric" placeholder="kr per month" style="max-width:150px">
+      <button class="btn pri" id="addTarget">Add target</button>
+    </div>`;
+
+  host.querySelectorAll('.tgt-r2').forEach(r => {
+    const key = decodeURIComponent(r.dataset.k || '');
+    r.querySelector('input')?.addEventListener('change', e => {
+      const v = parseFloat(e.target.value.replace(/\s/g, ''));
+      if (isFinite(v) && v > 0) CONF.targets.monthly[key] = Math.round(v);
+      confDirty = true; markDirty(); drawTargets();
+    });
+    r.querySelector('.cdel')?.addEventListener('click', () => {
+      delete CONF.targets.monthly[key]; confDirty = true; markDirty(); drawTargets();
+    });
+  });
+  $('addTarget').onclick = () => {
+    const k = $('newTargetKey').value;
+    const v = parseFloat($('newTargetVal').value.replace(/\s/g, ''));
+    if (!k) return toast('Choose a category or label');
+    if (!isFinite(v) || v <= 0) return toast('Set a monthly amount');
+    CONF.targets.monthly[k] = Math.round(v);
+    confDirty = true; markDirty(); drawTargets(); toast('Target added');
+  };
 }
 
 /* ========================================================== COVERAGE ===== */
