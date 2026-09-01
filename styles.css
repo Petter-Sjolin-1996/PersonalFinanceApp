@@ -665,3 +665,10 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
 .ovr-r{grid-template-columns:1fr 150px 150px 150px}
 .ovr-r select{width:100%;min-width:0;font-size:13px;padding:7px 9px}
 @media(max-width:820px){.ovr-r{grid-template-columns:1fr 1fr}.ovr-r b{grid-column:1/-1}.ovr-r .toggle{grid-column:1/-1}}
+.dupg{display:grid;grid-template-columns:130px 88px 1fr 100px 88px;gap:12px;align-items:center;
+  padding:10px 14px;border-bottom:1px solid var(--rule-2);font-size:13px}
+.dupg:last-child{border-bottom:0}
+.dupg .dupd{color:var(--muted);font-variant-numeric:tabular-nums}
+.dupg .dupm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dupg .v{text-align:right}
+@media(max-width:820px){.dupg{grid-template-columns:1fr 96px}.dupg .dupd,.dupg .v.muted{display:none}}
