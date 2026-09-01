@@ -662,3 +662,6 @@ select{font:400 13.5px "Inter",sans-serif;padding:8px 10px;border:1px solid var(
 .pvHead em{font-style:normal;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
 .preview .hbars{align-items:flex-end}
 .preview .note{margin-top:12px}
+.ovr-r{grid-template-columns:1fr 150px 150px 150px}
+.ovr-r select{width:100%;min-width:0;font-size:13px;padding:7px 9px}
+@media(max-width:820px){.ovr-r{grid-template-columns:1fr 1fr}.ovr-r b{grid-column:1/-1}.ovr-r .toggle{grid-column:1/-1}}
