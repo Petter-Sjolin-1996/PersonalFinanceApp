@@ -1,4 +1,4 @@
-import * as C from './core.js?v=30';
+import * as C from './core.js?v=31';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -123,8 +123,43 @@ const netOf  = m => m.tx.reduce((a, t) => a + (ann.workExpenses[t.fp] ? 0 : t.am
     A manual window, stated on your own authority, overrides that. */
 function effectiveCoverage() {
   const ov = CONF.meta.coverageOverride || {};
-  return [...(ledger.coverage || []),
-    ...Object.entries(ov).map(([account, w]) => ({ account, ...w, basis: 'manual' }))];
+  const auto = CONF.meta.coverageAutoMonth || {};
+  const out = [...(ledger.coverage || [])];
+
+  /* "Assume the export covers to the end of its last month." Amex declares no
+     period, so a final charge on the 28th otherwise reads as three missing
+     days and holds the whole month back. */
+  const first = {}, last = {};
+  for (const t of ledger.transactions) {
+    if (!first[t.account] || t.date < first[t.account]) first[t.account] = t.date;
+    if (!last[t.account] || t.date > last[t.account]) last[t.account] = t.date;
+  }
+  for (const [id, on] of Object.entries(auto)) {
+    if (!on || !last[id]) continue;
+    const [y, m] = last[id].split('-').map(Number);
+    const end = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    out.push({ account: id, from: first[id], to: end, basis: 'auto' });
+  }
+  out.push(...Object.entries(ov).map(([account, w]) => ({ account, ...w, basis: 'manual' })));
+  return out;
+}
+
+/** Month options spanning the ledger, plus a year either side. */
+function monthOptions(sel, endOfMonth) {
+  const ds = ledger.transactions.map(t => t.date).sort();
+  if (!ds.length) return '';
+  const start = new Date(ds[0] + 'T00:00:00Z'), stop = new Date(ds.at(-1) + 'T00:00:00Z');
+  start.setUTCMonth(start.getUTCMonth() - 2); stop.setUTCMonth(stop.getUTCMonth() + 2);
+  let h = '<option value="">—</option>';
+  for (let d = new Date(start); d <= stop; d.setUTCMonth(d.getUTCMonth() + 1)) {
+    const y = d.getUTCFullYear(), m = d.getUTCMonth() + 1;
+    const v = endOfMonth
+      ? new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10)
+      : `${y}-${String(m).padStart(2, '0')}-01`;
+    const lbl = d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+    h += `<option value="${v}"${v === sel ? ' selected' : ''}>${lbl}</option>`;
+  }
+  return h;
 }
 
 const trackedAccounts = () => (CONF.accounts || []).filter(a => a.tracked).map(a => a.id);
@@ -1045,13 +1080,17 @@ function drawCoverage() {
          Anything after ${end} is held back from insights until every account covers it.`
       : '<b>No complete months yet.</b> Every tracked account needs to cover the same calendar month.'}</div>
     <h3 class="sh">Declare coverage by hand</h3>
-    <p class="lede">Use this when an export has no declared period and the inferred window is wrong —
-      typically an Amex month whose first transaction falls late. Leave blank to go back to inference.</p>
+    <p class="lede"><b>To month end</b> is the setting you probably want: it treats an export as covering
+      the whole month its last transaction falls in. Amex declares no period, so a final charge on the 28th
+      otherwise looks like three missing days and holds the month back. The two dropdowns are for stating a
+      window outright; leave them blank to rely on the file.</p>
     <div class="tgt">${tracked.map(id => {
       const ov = (CONF.meta.coverageOverride || {})[id] || {};
+      const auto = (CONF.meta.coverageAutoMonth || {})[id];
       return `<div class="ovr-r" data-a="${id}"><b>${labels[id] || id}</b>
-        <span><input type="date" class="cvf" value="${ov.from || ''}"></span>
-        <span><input type="date" class="cvt" value="${ov.to || ''}"></span></div>`;
+        <label class="toggle"><input type="checkbox" class="cva" ${auto ? 'checked' : ''}> To month end</label>
+        <span><select class="cvf">${monthOptions(ov.from, false)}</select></span>
+        <span><select class="cvt">${monthOptions(ov.to, true)}</select></span></div>`;
     }).join('')}</div>
 
     <p class="note">Swedbank exports declare their own period in the file header, so their coverage is exact —
@@ -1060,14 +1099,21 @@ function drawCoverage() {
 
   $('viewCoverage').querySelectorAll('.ovr-r').forEach(r => {
     const id = r.dataset.a;
+    // Update state only. Re-drawing here would replace the control the user is
+    // still interacting with, which is what made the date picker unusable.
     const apply = () => {
       const from = r.querySelector('.cvf').value, to = r.querySelector('.cvt').value;
       const ov = CONF.meta.coverageOverride ||= {};
       if (from && to) ov[id] = { from, to }; else delete ov[id];
-      confDirty = true; markDirty(); drawCoverage();
+      confDirty = true; markDirty();
     };
     r.querySelector('.cvf').onchange = apply;
     r.querySelector('.cvt').onchange = apply;
+    r.querySelector('.cva').onchange = e => {
+      const auto = CONF.meta.coverageAutoMonth ||= {};
+      if (e.target.checked) auto[id] = true; else delete auto[id];
+      confDirty = true; markDirty(); drawCoverage();      // safe: a checkbox is done being touched
+    };
   });
 }
 
