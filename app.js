@@ -1,4 +1,4 @@
-import * as C from './core.js?v=31';
+import * as C from './core.js?v=32';
 
 /* Taxonomy, accounts, targets and thresholds are DATA, not program logic.
    They live in config.json in the private repo and are edited in-app.
@@ -848,6 +848,63 @@ function openSeg(m, group, label) {
 }
 
 
+
+/* ------------------------------------------------- duplicate repair ----- */
+/** Amex identities used to include the statement reference, which changes when
+    a period is re-exported — so overlapping imports landed as new rows. The
+    rule is fixed, but rows already in the ledger still carry old identities.
+    This recomputes them and offers to drop the extras. */
+let dupScan = null;
+
+async function scanDuplicates() {
+  const marked = await C.refingerprint(ledger.transactions);
+  const groups = new Map();
+  for (const m of marked) {
+    if (!groups.has(m.base)) groups.set(m.base, []);
+    groups.get(m.base).push(m);
+  }
+  dupScan = { marked, groups: [...groups.values()].filter(g => g.length > 1)
+    .sort((a, b) => Math.abs(b[0].row.amount) - Math.abs(a[0].row.amount)) };
+  drawCoverage();
+}
+
+async function applyRepair(dropAll) {
+  setSync('busy', 'repairing');
+  try {
+    const drop = new Set();
+    if (dropAll) {
+      document.querySelectorAll('.dupg').forEach(g => {
+        if (!g.querySelector('input').checked) return;
+        JSON.parse(g.dataset.drop).forEach(fp => drop.add(fp));
+      });
+    }
+    const remap = {};
+    const kept = [];
+    for (const m of dupScan.marked) {
+      if (drop.has(m.oldFp)) continue;
+      remap[m.oldFp] = m.fp;
+      kept.push({ ...m.row, fp: m.fp });
+    }
+    // annotations are keyed by fingerprint, so they have to follow
+    for (const store of ['workExpenses', 'oneOffs', 'corporatePrivate', 'txOverrides']) {
+      const next = {};
+      for (const [fp, v] of Object.entries(ann[store] || {})) if (remap[fp]) next[remap[fp]] = v;
+      ann[store] = next;
+    }
+    const removed = ledger.transactions.length - kept.length;
+    ledger.transactions = kept;
+    C.runMatchers(ledger.transactions);
+    shaL = await repo.write('ledger.json', ledger, shaL,
+      `Repair duplicates: ${removed} removed, identities recomputed`);
+    ann.updated = new Date().toISOString();
+    shaA = await repo.write('annotations.json', ann, shaA, 'Remap annotations after repair');
+    localStorage.setItem(SEEN_KEY, ann.updated);
+    dupScan = null; dirty = false; setSync('on', 'synced');
+    toast(removed ? `${removed} duplicate rows removed` : 'Identities recomputed, nothing removed');
+    drawCoverage();
+  } catch (e) { setSync('err', 'error'); banner(e.message); }
+}
+
 /* ========================================================== TARGETS ====== */
 /** A target key is either a group ("Food & Drinks") or a single label
     ("Food & Drinks / Alcohol"). Groups aggregate their labels. */
@@ -1093,10 +1150,34 @@ function drawCoverage() {
         <span><select class="cvt">${monthOptions(ov.to, true)}</select></span></div>`;
     }).join('')}</div>
 
+    <h3 class="sh">Duplicate check</h3>
+    <p class="lede">Amex identities used to include the statement reference, which changes when a period is
+      re-exported — so an overlapping import could land the same charge twice. The rule is fixed for future
+      imports; run this once to recompute identities on what is already stored and clear any duplicates.</p>
+    ${!dupScan ? '<button class="btn" id="dupScan">Scan for duplicates</button>' : (() => {
+      if (!dupScan.groups.length) return `<div class="callout"><b>No duplicates found.</b>
+        Identities still need recomputing so future imports line up.</div>
+        <button class="btn pri" id="dupApply">Recompute identities</button>`;
+      const total = dupScan.groups.reduce((a, g) => a + (g.length - 1), 0);
+      const kr2 = dupScan.groups.reduce((a, g) => a + Math.abs(g[0].row.amount) * (g.length - 1), 0);
+      return `<div class="callout"><b>${total} duplicate row${total > 1 ? 's' : ''} found</b>,
+        worth ${krN(kr2)} kr. Untick anything that is a genuine repeat purchase — two identical charges on
+        one day do happen.</div>
+        <div class="tgt">${dupScan.groups.map(g => `<div class="dupg" data-drop='${JSON.stringify(g.slice(1).map(x => x.oldFp))}'>
+          <label class="toggle"><input type="checkbox" checked> Remove ${g.length - 1}</label>
+          <span class="dupd">${g[0].row.date}</span>
+          <span class="dupm">${g[0].row.merchant}</span>
+          <span class="v num">${kr(g[0].row.amount)}</span>
+          <span class="v muted">${g.length} copies</span></div>`).join('')}</div>
+        <div class="addrow"><button class="btn pri" id="dupApply">Remove ticked and recompute</button></div>`;
+    })()}
+
     <p class="note">Swedbank exports declare their own period in the file header, so their coverage is exact —
       including days with no transactions. Amex exports carry no period and no running balance, so coverage is
       inferred from the first and last row, and a gap in the middle would not be visible.</p>`;
 
+  $('dupScan')?.addEventListener('click', scanDuplicates);
+  $('dupApply')?.addEventListener('click', () => applyRepair(true));
   $('viewCoverage').querySelectorAll('.ovr-r').forEach(r => {
     const id = r.dataset.a;
     // Update state only. Re-drawing here would replace the control the user is
