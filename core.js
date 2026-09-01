@@ -156,14 +156,27 @@ async function sha16(s) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
 }
 
-/** Radnummer shifts between exports, so it cannot be an identity key.
-    Balance alone is not enough either: on 2025-10-22 three transfers
-    (+2500 / −2500 / +2500) leave the balance identical on two rows.
-    Hence base hash + occurrence index within the colliding group. */
+/** What identifies a row depends on the source.
+
+    Swedbank carries a running balance, which pins a row down exactly.
+
+    Amex does not, and its reference is derived from the statement cycle, so the
+    same purchase re-exported later comes back under a different reference.
+    Including it meant every overlapping export looked like fresh transactions.
+    Description padding is unstable too, so the merchant is normalised. That
+    leaves account + date + amount + merchant, which is not unique on its own —
+    two FLYSAS charges of 872 kr on one day are real — and the occurrence index
+    carries that. */
+export function fpBase(r) {
+  return r.balance != null
+    ? [r.account, r.date, r.tdate, r.ref, r.desc, r.amount, r.balance].join('|')
+    : [r.account, r.date, r.amount, clean(r.merchant || r.desc).toUpperCase()].join('|');
+}
+
 export async function fingerprint(rows) {
   const seen = new Map();
   for (const r of rows) {
-    const base = await sha16([r.account, r.date, r.tdate, r.ref, r.desc, r.amount, r.balance].join('|'));
+    const base = await sha16(fpBase(r));
     const n = seen.get(base) || 0;
     seen.set(base, n + 1);
     r.fp = `${base}:${n}`;
@@ -276,10 +289,55 @@ export function runMatchers(tx) {
 
 /* ---------------------------------------------------------------- merge -- */
 
+/** An export is authoritative for its own period. If a file holds two identical
+    charges then there really were two; if the ledger already holds two,
+    re-importing must not make four. For each identity the ledger ends up with
+    the LARGER of the two counts, never the sum. */
 export function merge(existing, incoming) {
-  const have = new Set(existing.map(t => t.fp));
-  const added = incoming.filter(t => !have.has(t.fp));
+  const have = new Map();
+  for (const t of existing) {
+    const b = String(t.fp).split(':')[0];
+    have.set(b, (have.get(b) || 0) + 1);
+  }
+  const used = new Map();
+  const added = [];
+  for (const t of incoming) {
+    const b = String(t.fp).split(':')[0];
+    const n = used.get(b) || 0;
+    used.set(b, n + 1);
+    if (n < (have.get(b) || 0)) continue;          // ledger already holds this one
+    added.push({ ...t, fp: `${b}:${n}` });
+  }
   return { added, duplicates: incoming.length - added.length };
+}
+
+/** Recompute identity for rows already in the ledger, under the current
+    scheme. Needed once after the Amex rule changed, or old rows and new
+    imports will never recognise each other. */
+export async function refingerprint(rows) {
+  const seen = new Map();
+  const out = [];
+  for (const r of rows) {
+    const base = await sha16(fpBase(r));
+    const n = seen.get(base) || 0;
+    seen.set(base, n + 1);
+    out.push({ row: r, base, occ: n, fp: `${base}:${n}`, oldFp: r.fp });
+  }
+  return out;
+}
+
+/** Rows sharing an identity, for review. Not deleted automatically: a genuine
+    repeat purchase is indistinguishable from an import artefact in this data. */
+export function duplicateGroups(tx) {
+  const by = new Map();
+  for (const t of tx) {
+    const b = String(t.fp).split(':')[0];
+    if (!by.has(b)) by.set(b, []);
+    by.get(b).push(t);
+  }
+  return [...by.values()].filter(g => g.length > 1)
+    .map(g => ({ base: String(g[0].fp).split(':')[0], keep: g[0], extras: g.slice(1) }))
+    .sort((a, b) => Math.abs(b.keep.amount) - Math.abs(a.keep.amount));
 }
 
 /* --------------------------------------------------------------- GitHub -- */
